@@ -1,0 +1,21 @@
+{
+  "name": "fustercluck",
+  "version": "0.0.1",
+  "description": "",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc"
+  },
+  "author": "Matt Hinz <matthinz@gmail.com>",
+  "license": "CC0",
+  "devDependencies": {
+    "@tsconfig/node16": "^1.0.2",
+    "@types/debug": "^4.1.7",
+    "@types/node": "^17.0.13",
+    "prettier": "^2.5.1",
+    "typescript": "^4.5.5"
+  },
+  "dependencies": {
+    "debug": "^4.3.3"
+  }
+}
