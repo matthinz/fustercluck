@@ -4,6 +4,8 @@ import { runPrimary } from "./primary";
 import { Primary, RunOptions, RunResult, Worker } from "./types";
 import { runWorker } from "./worker";
 
+export { Primary, RunOptions, RunResult, Worker } from "./types";
+
 export function run<
   PrimaryMessage extends child.Serializable,
   WorkerMessage extends child.Serializable
