@@ -3,8 +3,13 @@
   "version": "0.0.1",
   "description": "",
   "main": "dist/index.js",
+  "files": [
+    "dist/**/*"
+  ],
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepack": "npm run clean && npm run build"
   },
   "author": "Matt Hinz <matthinz@gmail.com>",
   "license": "CC0",
