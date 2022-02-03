@@ -27,8 +27,8 @@ export function runPrimary<
   options: RunOptions<PrimaryMessage, WorkerMessage>
 ): PrimaryControl<WorkerMessage> {
   /**
-   * These batches are groups of messages we're monitoring to see when they've
-   * been taken up by a worker.
+   * Batches are groups of messages we monitor to see when they're
+   * taken up / processed by a worker.
    */
   type MessageBatch = {
     resolve: () => void;
@@ -68,7 +68,9 @@ export function runPrimary<
 
   const messagesToSend: Envelope<WorkerMessage>[] = [];
 
-  let messageBatches: MessageBatch[] = [];
+  let receivedMessageBatches: MessageBatch[] = [];
+
+  let processedMessageBatches: MessageBatch[] = [];
 
   let nextMessageId = 0;
 
@@ -77,7 +79,7 @@ export function runPrimary<
       return;
     }
 
-    primaryState = "running";
+    setPrimaryState("running");
 
     primary = createdPrimary;
 
@@ -155,6 +157,11 @@ export function runPrimary<
       throw new Error("primary not available");
     }
 
+    if (primaryState === "interrupted") {
+      worker.disconnect();
+      return;
+    }
+
     const { initializeWorker } = primary;
     const { id } = worker;
 
@@ -168,17 +175,32 @@ export function runPrimary<
 
     workerStates[worker.id] = "initializing";
 
+    // We use a custom version of sendToWorker() here that
+    // tracks the messages that get send at lets us wait
+    // for them to be confirmed.
+
+    const initMessagesToSend: WorkerMessage[] = [];
+
+    const sendToWorkerForInit = (m: WorkerMessage) => {
+      initMessagesToSend.push(m);
+    };
+
     initializeWorker
       .call(primary, {
-        sendToWorker,
+        sendToWorker: sendToWorkerForInit,
       })
-      .then(() => true)
+      .then(() => sendToWorkersAndWaitForProcessing(initMessagesToSend))
       .catch((err) => {
         log(`[${id}]: Error during initialization`, err);
         worker.disconnect();
         return false;
       })
       .then((succeeded) => {
+        if (primaryState === "interrupted") {
+          worker.disconnect();
+          return;
+        }
+
         if (succeeded && worker.isConnected()) {
           workerStates[worker.id] = "ready";
           scheduleTick();
@@ -198,8 +220,8 @@ export function runPrimary<
     });
   }
 
-  function handleWorkerHandling(messageIds: number[]) {
-    messageBatches = messageBatches
+  function handleWorkerProcessed(messageIds: number[]) {
+    processedMessageBatches = processedMessageBatches
       .map((batch) => {
         batch.envelopes = batch.envelopes
           .map((e) => {
@@ -211,7 +233,28 @@ export function runPrimary<
           .filter((e) => e !== undefined) as Envelope<WorkerMessage>[];
 
         if (batch.envelopes.length === 0) {
-          log(`resolve batch for ${JSON.stringify(messageIds)}`);
+          setImmediate(batch.resolve);
+          return undefined;
+        }
+
+        return batch;
+      })
+      .filter((b) => b !== undefined) as MessageBatch[];
+  }
+
+  function handleWorkerReceived(messageIds: number[]) {
+    receivedMessageBatches = receivedMessageBatches
+      .map((batch) => {
+        batch.envelopes = batch.envelopes
+          .map((e) => {
+            if (messageIds.includes(e.id)) {
+              return undefined;
+            }
+            return e;
+          })
+          .filter((e) => e !== undefined) as Envelope<WorkerMessage>[];
+
+        if (batch.envelopes.length === 0) {
           setImmediate(batch.resolve);
           return undefined;
         }
@@ -228,28 +271,34 @@ export function runPrimary<
     workerId: number;
     envelope: Envelope<ControlMessage<WorkerMessage>>;
   }) {
-    log(`receive from ${workerId}: ${JSON.stringify(message)}`);
+    log.enabled && log(`receive from ${workerId}: ${JSON.stringify(message)}`);
+
     switch (message.__type__) {
-      case "worker_handling": {
-        // This worker is taking on some of the messages we've sent it!
-        handleWorkerHandling(message.messageIds);
-        setWorkerState(workerId, message.canTakeMore ? "ready" : "busy");
-        break;
-      }
-      case "worker_not_busy": {
-        // This worker is no longer busy!
-        setWorkerState(workerId, "ready");
-        break;
-      }
-      case "worker_too_busy": {
-        // Mark the worker as busy and put its messages back in the queue
-        // to be dispatched.
+      case "worker_busy": {
+        // This worker is too busy to process the things we sent it.
         setWorkerState(workerId, "busy");
         messagesToSend.push(...message.envelopes);
+        scheduleTick();
         break;
       }
-      default:
-        throw new Error(`Invalid control message type: ${message.__type__}`);
+      case "worker_processed": {
+        handleWorkerProcessed(message.messageIds);
+        setWorkerState(workerId, message.canTakeMore ? "ready" : "busy");
+        scheduleTick();
+        break;
+      }
+      case "worker_ready": {
+        setWorkerState(workerId, "ready");
+        scheduleTick();
+        break;
+      }
+      case "worker_received": {
+        // This worker is taking on some of the messages we've sent it!
+        handleWorkerReceived(message.messageIds);
+        setWorkerState(workerId, message.canTakeMore ? "ready" : "busy");
+        scheduleTick();
+        break;
+      }
     }
   }
 
@@ -303,13 +352,25 @@ export function runPrimary<
     messages: WorkerMessage[] | WorkerMessage
   ): Promise<void> {
     return new Promise((resolve, reject) => {
+      if (primaryState === "interrupted") {
+        reject(
+          new Error("Can't send to workers after stop() has been called.")
+        );
+        return;
+      }
+
       const envelopes = (Array.isArray(messages) ? messages : [messages]).map(
         envelope
       );
 
+      if (envelopes.length === 0) {
+        resolve();
+        return;
+      }
+
       messagesToSend.push(...envelopes);
 
-      messageBatches.push({
+      receivedMessageBatches.push({
         envelopes,
         reject,
         resolve,
@@ -317,6 +378,45 @@ export function runPrimary<
 
       scheduleTick();
     });
+  }
+
+  function sendToWorkersAndWaitForProcessing(
+    messages: WorkerMessage[] | WorkerMessage
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (primaryState === "interrupted") {
+        reject(
+          new Error("Can't send to workers after stop() has been called.")
+        );
+      }
+
+      const envelopes = (Array.isArray(messages) ? messages : [messages]).map(
+        envelope
+      );
+
+      if (envelopes.length === 0) {
+        resolve();
+        return;
+      }
+
+      messagesToSend.push(...envelopes);
+
+      processedMessageBatches.push({
+        envelopes,
+        reject,
+        resolve,
+      });
+
+      scheduleTick();
+    });
+  }
+
+  function setPrimaryState(state: PrimaryState) {
+    if (primaryState === state) {
+      return;
+    }
+    log("%s -> %s", primaryState, state);
+    primaryState = state;
   }
 
   function setWorkerState(workerId: number, state: WorkerState) {
@@ -334,24 +434,45 @@ export function runPrimary<
   function spawnWorkers() {
     const workerCount = Object.keys(workerStates).length;
     const wanted = workersWanted();
+
+    if (workerCount >= wanted) {
+      return;
+    }
+
+    cluster.setupPrimary({
+      // @ts-ignore
+      serialization: "advanced",
+    });
+
     for (let i = workerCount; i < wanted; i++) {
       cluster.fork();
     }
   }
 
   function stop(): Promise<void> {
-    primaryState = "interrupted";
+    return new Promise((resolve, reject) => {
+      setPrimaryState("interrupted");
 
-    process.off("message", handleMessage);
-    cluster.off("online", handleOnline);
-    cluster.off("disconnect", handleDisconnect);
+      tryToStop();
 
-    if (tickImmediate) {
-      clearImmediate(tickImmediate);
-      tickImmediate = undefined;
-    }
+      function tryToStop() {
+        const canStop = Object.keys(workerStates).length === 0;
 
-    return Promise.resolve();
+        if (!canStop) {
+          setTimeout(tryToStop, 100);
+          return;
+        }
+
+        process.off("message", handleMessage);
+        cluster.off("online", handleOnline);
+        cluster.off("disconnect", handleDisconnect);
+
+        if (tickImmediate) {
+          clearImmediate(tickImmediate);
+          tickImmediate = undefined;
+        }
+      }
+    });
   }
 
   /**
@@ -362,32 +483,34 @@ export function runPrimary<
     tickImmediate = undefined;
 
     // Send any control messages we need to
-    while (controlMessagesToSend.length > 0) {
-      const m = controlMessagesToSend.shift();
-      if (!m) {
-        throw new Error("null entry in controlMessagesToSend");
-      }
-
-      // control messages have to be sent to a specific worker
-      const worker = cluster.workers && cluster.workers[m.workerId];
-      if (!worker) {
-        log(
-          `[${
-            m.workerId
-          }] Attempting to send control message to nonexisting worker: ${JSON.stringify(
-            m
-          )}`
-        );
-        continue;
-      }
-
-      worker.send(m, (err) => {
-        if (err) {
-          log(`[${m.workerId}] Error sending message`, err);
-          controlMessagesToSend.push(m);
-          scheduleTick();
+    if (primaryState !== "interrupted") {
+      while (controlMessagesToSend.length > 0) {
+        const m = controlMessagesToSend.shift();
+        if (!m) {
+          throw new Error("null entry in controlMessagesToSend");
         }
-      });
+
+        // control messages have to be sent to a specific worker
+        const worker = cluster.workers && cluster.workers[m.workerId];
+        if (!worker) {
+          log(
+            `[${
+              m.workerId
+            }] Attempting to send control message to nonexisting worker: ${JSON.stringify(
+              m
+            )}`
+          );
+          continue;
+        }
+
+        worker.send(m, (err) => {
+          if (err) {
+            log(`[${m.workerId}] Error sending message`, err);
+            controlMessagesToSend.push(m);
+            scheduleTick();
+          }
+        });
+      }
     }
 
     // Process any control messages we've received.
@@ -409,10 +532,10 @@ export function runPrimary<
         throw new Error("null entry in messagesToProcess");
       }
       const prevPrimaryState = primaryState;
-      primaryState = "processing";
+      setPrimaryState("processing");
       processMessage(m.envelope.message).then(() => {
         if (primaryState === "processing") {
-          primaryState = prevPrimaryState;
+          setPrimaryState(prevPrimaryState);
         }
         scheduleTick();
       });

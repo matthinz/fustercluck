@@ -7,6 +7,10 @@ type WorkerControls = {
   stop: () => Promise<void>;
 };
 
+// Interval at which we tell the primary which messages we've finished processing.
+const PROCESSED_DEBOUNCE_INTERVAL = 250;
+const MAX_PROCESSED_BATCH_SIZE = 1000;
+
 export function runWorker<PrimaryMessage, WorkerMessage>(
   options: RunOptions<PrimaryMessage, WorkerMessage>
 ): WorkerControls {
@@ -26,6 +30,12 @@ export function runWorker<PrimaryMessage, WorkerMessage>(
   // This array tracks the ids of messages that have been submitted for
   // processing but we haven't told the primary about yet
   let currentProcessingBatch: number[] = [];
+
+  let processedMessageIds: number[] = [];
+
+  // This timeout tracks when we'll send a notifcation to the primary about the
+  // messages we've successfully processed.
+  let processedNotificationTimeout: NodeJS.Timeout | undefined;
 
   let tickImmediate: NodeJS.Immediate | undefined;
 
@@ -74,10 +84,31 @@ export function runWorker<PrimaryMessage, WorkerMessage>(
     }
   }
 
-  function processControlMessage(m: ControlMessage<WorkerMessage>) {
-    switch (m.__type__) {
-      case "you_up": {
-      }
+  function processControlMessage(m: ControlMessage<WorkerMessage>) {}
+
+  function notifyPrimaryOfProcessedMessages() {
+    if (processedNotificationTimeout) {
+      clearTimeout(processedNotificationTimeout);
+      processedNotificationTimeout = undefined;
+    }
+
+    if (processedMessageIds.length > MAX_PROCESSED_BATCH_SIZE) {
+      doNotify();
+      return;
+    }
+
+    processedNotificationTimeout = setTimeout(
+      doNotify,
+      PROCESSED_DEBOUNCE_INTERVAL
+    );
+
+    function doNotify() {
+      sendToPrimary({
+        __type__: "worker_processed",
+        messageIds: processedMessageIds,
+        canTakeMore: worker ? !worker.isBusy() : false,
+      });
+      processedMessageIds = [];
     }
   }
 
@@ -144,7 +175,7 @@ export function runWorker<PrimaryMessage, WorkerMessage>(
       // ones we've dealt with so far.
       if (currentProcessingBatch.length > 0) {
         sendToPrimary({
-          __type__: "worker_handling",
+          __type__: "worker_received",
           messageIds: currentProcessingBatch,
           canTakeMore: !busy,
         });
@@ -156,7 +187,7 @@ export function runWorker<PrimaryMessage, WorkerMessage>(
     if (busy) {
       // We're busy. Return all messages to the primary
       sendToPrimary({
-        __type__: "worker_too_busy",
+        __type__: "worker_busy",
         envelopes: [e, ...messagesToProcess],
       });
       messagesToProcess = [];
@@ -170,6 +201,8 @@ export function runWorker<PrimaryMessage, WorkerMessage>(
         throw new Error("worker not available");
       }
 
+      log(`BEGIN processing ${e.id}: ${JSON.stringify(e.message)}`);
+
       let promise: Promise<unknown>;
       try {
         promise = Promise.resolve(worker.handle(e.message, { sendToPrimary }));
@@ -177,16 +210,24 @@ export function runWorker<PrimaryMessage, WorkerMessage>(
         promise = Promise.reject(err);
       }
 
-      promise.catch((err: any) => {
-        log("Error processing message", err);
-        messagesToProcess.push(e);
-        scheduleTick();
-      });
+      promise
+        .then(() => {
+          log(`END processing ${e.id}: ${JSON.stringify(e.message)}`);
+
+          processedMessageIds.push(e.id);
+
+          notifyPrimaryOfProcessedMessages();
+        })
+        .catch((err: any) => {
+          log("Error processing ${e.id}", err);
+          messagesToProcess.push(e);
+          scheduleTick();
+        });
     }, e);
 
     if (messagesToProcess.length === 0 && currentProcessingBatch.length > 0) {
       sendToPrimary({
-        __type__: "worker_handling",
+        __type__: "worker_received",
         messageIds: currentProcessingBatch,
         canTakeMore: !busy,
       });

@@ -1,10 +1,10 @@
 import { Envelope } from "./types";
 
 const CONTROL_MESSAGE_TYPES = [
-  "worker_not_busy",
-  "worker_too_busy",
-  "worker_handling",
-  "you_up",
+  "worker_busy",
+  "worker_processed",
+  "worker_ready",
+  "worker_received",
 ] as const;
 
 type ControlMessageBase = {
@@ -12,48 +12,47 @@ type ControlMessageBase = {
 };
 
 /**
- * worker_handling indicates that the worker has started processing the
- * given messages.
+ * Indicates that the worker has started processing the given messages.
  */
-type WorkerHandlingMessage = ControlMessageBase & {
-  __type__: "worker_handling";
+type WorkerReceivedMessage = ControlMessageBase & {
+  __type__: "worker_received";
   messageIds: number[];
   canTakeMore: boolean;
 };
 
 /**
- * worker_too_busy sent from worker to primary to indicate it's too busy to
- * handle any messages right now (and provide back any extra messages it
- * can't handle ATM).
+ * Indicates that the worker has completed processing the given messages.
  */
-type WorkerTooBusyMessage<WorkerMessage> = ControlMessageBase & {
-  __type__: "worker_too_busy";
+type WorkerProcessedMessage = ControlMessageBase & {
+  __type__: "worker_processed";
+  messageIds: number[];
+  canTakeMore: boolean;
+};
+
+/**
+ * worker_busy indicates that the worker can't take any more messages.
+ * Unprocessed messages are returned in their original envelopes.
+ */
+type WorkerBusyMessage<WorkerMessage> = ControlMessageBase & {
+  __type__: "worker_busy";
   envelopes: Envelope<WorkerMessage>[];
 };
 
 /**
- * worker_not_busy sent from worker to primary to indicate that it is ready
- * to receive messages.
+ * worker_ready indicates a worker is ready to receive messages.
  */
-type WorkerNotBusyMessage = ControlMessageBase & {
-  __type__: "worker_not_busy";
-};
-
-/**
- * You Up? Is sent from primary to worker to see if it has any extra capacity.
- */
-type YouUpMessage = ControlMessageBase & {
-  __type__: "you_up";
+type WorkerReadyMessage = ControlMessageBase & {
+  __type__: "worker_ready";
 };
 
 /**
  * Control messages are sent to communicate the state of members of the system.
  */
 export type ControlMessage<WorkerMessage> =
-  | WorkerHandlingMessage
-  | WorkerTooBusyMessage<WorkerMessage>
-  | WorkerNotBusyMessage
-  | YouUpMessage;
+  | WorkerBusyMessage<WorkerMessage>
+  | WorkerReadyMessage
+  | WorkerReceivedMessage
+  | WorkerProcessedMessage;
 
 /**
  * Attempts to parse a ControlMessage out of an unknown piece of data.
