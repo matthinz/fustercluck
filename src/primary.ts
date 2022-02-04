@@ -443,6 +443,10 @@ export function runPrimary<
    * Forks new workers up to our limit.
    */
   function spawnWorkers() {
+    if (primaryState === "interrupted") {
+      return;
+    }
+
     const workerCount = Object.keys(workerStates).length;
     const wanted = workersWanted();
 
