@@ -1,5 +1,5 @@
 import child from "child_process";
-import cluster, { Worker as ClusterWorker, Worker } from "cluster";
+import cluster, { Worker as ClusterWorker } from "cluster";
 import debug from "debug";
 import os from "os";
 import { ControlMessage, parseControlMessage, parseEnvelope } from "./messages";

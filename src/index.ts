@@ -1,10 +1,18 @@
 import child from "child_process";
-import cluster, { Worker as ClusterWorker } from "cluster";
+import cluster from "cluster";
 import { runPrimary } from "./primary";
-import { Primary, RunOptions, RunResult, Worker } from "./types";
+import { RunOptions, RunResult } from "./types";
 import { runWorker } from "./worker";
 
-export { Primary, RunOptions, RunResult, Worker } from "./types";
+export {
+  InitializeWorkerOptions,
+  Primary,
+  PrimaryHandleOptions,
+  RunOptions,
+  RunResult,
+  Worker,
+  WorkerHandleOptions,
+} from "./types";
 
 export function run<
   PrimaryMessage extends child.Serializable,
