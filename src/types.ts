@@ -36,12 +36,12 @@ export type Primary<PrimaryMessage, WorkerMessage> = {
 
   /**
    * If defined, initializeWorker is called when a new worker comes online.
-   * dispatch() will not be called for the worker until initializeWorker()
-   * completes.
+   * No additional messages will be sent to the worker until all messages
+   * sent during initialization have been processed.
    */
   initializeWorker?: (
     options: InitializeWorkerOptions<PrimaryMessage, WorkerMessage>
-  ) => Promise<unknown>;
+  ) => Promise<unknown> | void;
 
   /**
    * Converts unknown input into a strongly-typed message.

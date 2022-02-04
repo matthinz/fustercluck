@@ -187,10 +187,18 @@ export function runPrimary<
       initMessagesToSend.push(m);
     };
 
-    initializeWorker
-      .call(primary, {
-        sendToWorker: sendToWorkerForInit,
-      })
+    let promise: Promise<unknown>;
+    try {
+      promise = Promise.resolve(
+        initializeWorker.call(primary, {
+          sendToWorker: sendToWorkerForInit,
+        })
+      );
+    } catch (err: any) {
+      promise = Promise.reject(err);
+    }
+
+    promise
       .then(() => sendToWorkersAndWaitForProcessing(initMessagesToSend))
       .catch((err) => {
         log(`[${id}]: Error during initialization`, err);
