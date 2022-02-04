@@ -6,8 +6,9 @@ import { ControlMessage, parseControlMessage, parseEnvelope } from "./messages";
 
 import { Envelope, Primary, RunOptions } from "./types";
 
-type PrimaryControl<WorkerMessage> = {
+type PrimaryControl<PrimaryMessage, WorkerMessage> = {
   sendToWorkers(messages: WorkerMessage[] | WorkerMessage): Promise<void>;
+  sendToPrimary(messages: PrimaryMessage | PrimaryMessage[]): void;
   stop(): Promise<void>;
 };
 
@@ -25,7 +26,7 @@ export function runPrimary<
   WorkerMessage extends child.Serializable
 >(
   options: RunOptions<PrimaryMessage, WorkerMessage>
-): PrimaryControl<WorkerMessage> {
+): PrimaryControl<PrimaryMessage, WorkerMessage> {
   /**
    * Batches are groups of messages we monitor to see when they're
    * taken up / processed by a worker.
@@ -90,6 +91,7 @@ export function runPrimary<
 
   return {
     stop,
+    sendToPrimary,
     sendToWorkers,
   };
 
@@ -331,10 +333,11 @@ export function runPrimary<
     }
   }
 
-  function sendToPrimary(message: PrimaryMessage) {
-    messagesToProcess.push({
-      envelope: envelope(message),
-    });
+  function sendToPrimary(message: PrimaryMessage | PrimaryMessage[]) {
+    const messages = Array.isArray(message) ? message : [message];
+    messagesToProcess.push(
+      ...messages.map((message) => ({ envelope: envelope(message) }))
+    );
     scheduleTick();
   }
 

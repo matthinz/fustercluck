@@ -111,6 +111,11 @@ export type RunOptions<PrimaryMessage, WorkerMessage> = {
 
 export type RunResult<PrimaryMessage, WorkerMessage> = {
   /**
+   * Allows the primary to send a message to itself.
+   */
+  sendToPrimary?: (messages: PrimaryMessage | PrimaryMessage[]) => void;
+
+  /**
    * Sends a batch of messages to workers and returns a Promise that resolves
    * once workers have confirmed receipt of the messages.
    * @param messages
