@@ -548,6 +548,10 @@ export function runPrimary<
       }
       const prevPrimaryState = primaryState;
       setPrimaryState("processing");
+
+      log.enabled &&
+        log(`receive from ${m.workerId}: ${JSON.stringify(m.envelope)}`);
+
       processMessage(m.envelope.message).then(() => {
         if (primaryState === "processing") {
           setPrimaryState(prevPrimaryState);

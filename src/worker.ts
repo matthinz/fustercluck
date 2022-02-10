@@ -158,6 +158,7 @@ export function runWorker<PrimaryMessage, WorkerMessage>(
       if (!e) {
         throw new Error("null entry in messages to send");
       }
+      log.enabled && log(`send to primary: ${JSON.stringify(e)}`);
       send.call(process, e, undefined, undefined, (err) => {
         if (err) {
           log("Error sending message", err, e);
