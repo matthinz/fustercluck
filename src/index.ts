@@ -1,29 +1,20 @@
-import child from "child_process";
 import cluster from "cluster";
-import { runPrimary } from "./primary";
-import { RunOptions, RunResult } from "./types";
-import { runWorker } from "./worker";
+import { startPrimary } from "./primary";
+import { MessageBase, StartOptions, StartResult } from "./types";
+import { startWorker } from "./worker";
 
-export {
-  InitializeWorkerOptions,
-  Primary,
-  PrimaryHandleOptions,
-  RunOptions,
-  RunResult,
-  Worker,
-  WorkerHandleOptions,
-} from "./types";
+export { Primary, Worker } from "./types";
 
-export function run<
-  PrimaryMessage extends child.Serializable,
-  WorkerMessage extends child.Serializable
+export function start<
+  PrimaryMessage extends MessageBase,
+  WorkerMessage extends MessageBase
 >(
-  options: RunOptions<PrimaryMessage, WorkerMessage>
-): RunResult<PrimaryMessage, WorkerMessage> {
+  options?: StartOptions<PrimaryMessage, WorkerMessage>
+): StartResult<PrimaryMessage, WorkerMessage> {
   if (cluster.isPrimary) {
-    return runPrimary(options);
+    return startPrimary(options);
   } else if (cluster.isWorker) {
-    return runWorker(options);
+    return startWorker(options);
   } else {
     throw new Error("Neither a primary nor a worker. Is this Node 16?");
   }

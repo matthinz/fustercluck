@@ -1,112 +1,113 @@
-import child from "child_process";
+import { spawn } from "child_process";
 import cluster, { Worker as ClusterWorker } from "cluster";
 import debug from "debug";
+import { EventEmitter } from "events";
 import os from "os";
-import { ControlMessage, parseControlMessage, parseEnvelope } from "./messages";
-
-import { Envelope, Primary, RunOptions } from "./types";
-
-type PrimaryControl<PrimaryMessage, WorkerMessage> = {
-  sendToWorkers(messages: WorkerMessage[] | WorkerMessage): Promise<void>;
-  sendToPrimary(messages: PrimaryMessage | PrimaryMessage[]): void;
-  stop(): Promise<void>;
-};
+import { createMessageBatch, MessageBatch } from "./batch";
+import {
+  parsePrimaryControlMessage,
+  PrimaryControlMessage,
+  WorkerControlMessage,
+} from "./messages";
+import {
+  MessageBase,
+  MessageHandlers,
+  Primary,
+  StartOptions,
+  WorkerError,
+} from "./types";
 
 type WorkerState = "initializing" | "ready" | "busy";
 
-type PrimaryState =
-  | "initializing"
-  | "running"
-  | "interrupted"
-  | "processing"
-  | "dispatching";
+type PrimaryState = "not_started" | "started" | "stopping" | "stopped";
 
-export function runPrimary<
-  PrimaryMessage extends child.Serializable,
-  WorkerMessage extends child.Serializable
+type PrimaryEvent = "error" | "receive" | "send" | "stop";
+
+type ErrorListener = (error: WorkerError) => void;
+
+type ReceiveListener<PrimaryMessage> = (m: PrimaryMessage) => void;
+
+type SendListener<WorkerMessage> = (m: WorkerMessage) => void;
+
+type StopListener = () => void;
+
+export function startPrimary<
+  PrimaryMessage extends MessageBase,
+  WorkerMessage extends MessageBase
 >(
-  options: RunOptions<PrimaryMessage, WorkerMessage>
-): PrimaryControl<PrimaryMessage, WorkerMessage> {
-  /**
-   * Batches are groups of messages we monitor to see when they're
-   * taken up / processed by a worker.
-   */
-  type MessageBatch = {
-    resolve: () => void;
-    reject: (err: any) => void;
-    envelopes: Envelope<WorkerMessage>[];
+  options?: StartOptions<PrimaryMessage, WorkerMessage>
+): Primary<PrimaryMessage, WorkerMessage> {
+  type PrimaryControlMessageWithWorkerId =
+    PrimaryControlMessage<PrimaryMessage> & { workerId?: number };
+
+  type WorkerControlMessageWithWorkerId =
+    WorkerControlMessage<WorkerMessage> & { workerId?: number };
+
+  type SentWorkerMessage = {
+    message: WorkerControlMessage<WorkerMessage>;
+    state: "unsent" | "sent" | "received" | "processed";
   };
 
   const log = debug(`fustercluck:primary`);
 
-  // `primaryState` tracks the current state of the primary.
-  let primaryState: PrimaryState = "initializing";
+  const messageHandlers = {} as MessageHandlers<PrimaryMessage>;
 
-  let primary: Primary<PrimaryMessage, WorkerMessage> | undefined;
+  const messagesToProcess: PrimaryControlMessageWithWorkerId[] = [];
+
+  const messagesToSend: WorkerControlMessageWithWorkerId[] = [];
+
+  const sentMessagesById: {
+    [id: number]: SentWorkerMessage | undefined;
+  } = {};
+
+  const sentMessageBatches: MessageBatch[] = [];
+
+  // `nextMessageId` tracks the next ID to be assigned to a message we send.
+  let nextMessageId = 0;
+
+  // `primaryState` tracks the current state of the primary.
+  let primaryState: PrimaryState = "not_started";
+
+  // `tickImmediate` holds on to the handle of the timer used to schedule the
+  // next `tick` invocation to avoid duplicate scheduling.
+  let tickImmediate: NodeJS.Immediate | undefined;
+  let tickTimeout: NodeJS.Timeout | undefined;
+  let nextTickDelay: number | undefined;
 
   // `workerStates` is a dictionary linking worker id to the associated state.
   const workerStates: { [id: number]: WorkerState } = {};
 
-  // `tickImmediate` holds on to the handle of the timer used to schedule the
-  // next `tick` invocation to duplicate scheduling.
-  let tickImmediate: NodeJS.Immediate | undefined;
+  const emitter = new EventEmitter();
 
-  // These queues are first-in-first-out.
-  const controlMessagesToProcess: {
-    workerId: number;
-    envelope: Envelope<ControlMessage<WorkerMessage>>;
-  }[] = [];
+  // workerInitializer is an (optional) function that returns a Promise of a
+  // message to send to a new worker when it comes online. The worker will
+  // not be sent anymore messages until this message is processed.
+  // Users can set this initializer using the `initializeWorkersWith()` function.
+  let workerInitializer: (() => Promise<WorkerMessage>) | undefined;
 
-  const controlMessagesToSend: {
-    workerId: number;
-    envelope: Envelope<ControlMessage<WorkerMessage>>;
-  }[] = [];
-
-  const messagesToProcess: {
-    workerId?: number;
-    envelope: Envelope<PrimaryMessage>;
-  }[] = [];
-
-  const messagesToSend: Envelope<WorkerMessage>[] = [];
-
-  let receivedMessageBatches: MessageBatch[] = [];
-
-  let processedMessageBatches: MessageBatch[] = [];
-
-  let nextMessageId = 0;
-
-  Promise.resolve(options.createPrimary()).then((createdPrimary) => {
-    if (primaryState === "interrupted") {
-      return;
-    }
-
-    setPrimaryState("running");
-
-    primary = createdPrimary;
-
-    bindEvents();
-
-    spawnWorkers();
-  });
+  // stoppingPromise is a Promise that resolves once the primary has been
+  // stopped and all workers have disconnected.
+  let stoppingPromise: Promise<void> | undefined;
 
   return {
+    role: "primary",
+    handle,
+    initializeWorkersWith,
+    on,
     stop,
     sendToPrimary,
     sendToWorkers,
+    sendToWorkersAndWaitForProcessing,
+    sendToWorkersAndWaitForReceipt,
   };
 
-  function bindEvents() {
-    cluster.on("disconnect", handleDisconnect);
-    cluster.on("online", handleOnline);
-    cluster.on("message", handleMessage);
-    process.on("SIGINT", handleSigInt);
-  }
-
-  function envelope<Message>(message: Message): Envelope<Message> {
-    return {
-      id: nextMessageId++,
-      message,
-    };
+  function handle<
+    MessageType extends PrimaryMessage["type"],
+    Message extends PrimaryMessage & { type: MessageType }
+  >(type: MessageType, handler: (m: Message) => void | Promise<void>) {
+    const handlers = messageHandlers[type] ?? [];
+    handlers.push(handler as (m: PrimaryMessage) => void | Promise<void>);
+    messageHandlers[type] = handlers;
   }
 
   function handleDisconnect(worker: ClusterWorker) {
@@ -116,38 +117,28 @@ export function runPrimary<
     spawnWorkers();
   }
 
+  /**
+   * Handles a new message coming in from a worker.
+   * @param worker
+   * @param input
+   * @returns
+   */
   function handleMessage(worker: ClusterWorker, input: unknown) {
-    if (!primary) {
-      throw new Error("primary not available");
-    }
-
-    const controlMessageEnvelope = parseEnvelope<ControlMessage<WorkerMessage>>(
+    const message = parsePrimaryControlMessage(
       input,
-      parseControlMessage
+      options?.parsePrimaryMessage
     );
 
-    if (controlMessageEnvelope != null) {
-      controlMessagesToProcess.push({
-        workerId: worker.id,
-        envelope: controlMessageEnvelope,
-      });
-      scheduleTick();
+    if (!message) {
       return;
     }
 
-    const envelope = parseEnvelope(input, primary.parseMessage);
+    messagesToProcess.push({
+      ...message,
+      workerId: worker.id,
+    });
 
-    if (envelope) {
-      messagesToProcess.push({
-        workerId: worker.id,
-        envelope: envelope,
-      });
-      scheduleTick();
-      return;
-    }
-
-    // This is not a message we can process.
-    log("Received unprocessable message", input);
+    scheduleTick("got message");
   }
 
   /**
@@ -155,21 +146,16 @@ export function runPrimary<
    * then marks the worker as "ready" to be sent messages.
    */
   function handleOnline(worker: ClusterWorker) {
-    if (!primary) {
-      throw new Error("primary not available");
-    }
-
-    if (primaryState === "interrupted") {
+    if (primaryState !== "started") {
       worker.disconnect();
       return;
     }
 
-    const { initializeWorker } = primary;
     const { id } = worker;
 
     log(`[${id}] online`);
 
-    if (!initializeWorker) {
+    if (!workerInitializer) {
       // No initialization is necessary
       workerStates[id] = "ready";
       return;
@@ -177,181 +163,269 @@ export function runPrimary<
 
     workerStates[worker.id] = "initializing";
 
-    // We use a custom version of sendToWorker() here that
-    // tracks the messages that get send at lets us wait
-    // for them to be confirmed.
-
-    const initMessagesToSend: WorkerMessage[] = [];
-
-    const sendToWorkerForInit = (m: WorkerMessage) => {
-      initMessagesToSend.push(m);
-    };
-
-    let promise: Promise<unknown>;
-    try {
-      promise = Promise.resolve(
-        initializeWorker.call(primary, {
-          sendToWorker: sendToWorkerForInit,
-        })
-      );
-    } catch (err: any) {
-      promise = Promise.reject(err);
-    }
-
-    promise
-      .then(() => sendToWorkersAndWaitForProcessing(initMessagesToSend))
+    // Send an initialization message to the worker, and wait for it to be processed.
+    workerInitializer()
+      .then((message) => sendToWorkerAndWaitForProcessing(id, message))
       .catch((err) => {
         log(`[${id}]: Error during initialization`, err);
         worker.disconnect();
         return false;
       })
       .then((succeeded) => {
-        if (primaryState === "interrupted") {
+        if (primaryState !== "started") {
+          // Something happened in the interim
           worker.disconnect();
           return;
         }
 
         if (succeeded && worker.isConnected()) {
           workerStates[worker.id] = "ready";
-          scheduleTick();
+          scheduleTick("worker ready");
         }
       });
   }
 
+  /**
+   * Handles receiving the SIGINT signal.
+   */
   function handleSigInt() {
-    if (primaryState === "interrupted") {
+    if (primaryState === "stopping") {
       // We were already interrupted once, we're being asked _again_ to close.
-      process.exit(1);
+      // Force a stop.
+      stop(true);
       return;
     }
 
-    stop().then(() => {
-      process.exit();
-    });
+    stop();
   }
 
+  function handleWorkerBusy(workerId: number, messageIds: number[]) {
+    setWorkerState(workerId, "busy");
+
+    if (messageIds.length === 0) {
+      return;
+    }
+
+    messagesToSend.push(
+      ...messageIds.map((id) => {
+        const sent = sentMessagesById[id];
+        if (!sent) {
+          throw new Error(`Message not found by id: ${id}`);
+        }
+        return {
+          ...sent.message,
+          workerId,
+        };
+      })
+    );
+
+    scheduleTick("worker is busy");
+  }
+
+  /**
+   * Called when a worker notifies us that it has processed one or more messages.
+   * @param messageIds
+   */
   function handleWorkerProcessed(messageIds: number[]) {
-    processedMessageBatches = processedMessageBatches
-      .map((batch) => {
-        batch.envelopes = batch.envelopes
-          .map((e) => {
-            if (messageIds.includes(e.id)) {
-              return undefined;
-            }
-            return e;
-          })
-          .filter((e) => e !== undefined) as Envelope<WorkerMessage>[];
-
-        if (batch.envelopes.length === 0) {
-          setImmediate(batch.resolve);
-          return undefined;
-        }
-
-        return batch;
-      })
-      .filter((b) => b !== undefined) as MessageBatch[];
+    for (let i = 0; i < sentMessageBatches.length; i++) {
+      const batch = sentMessageBatches[i];
+      batch.markProcessed(messageIds);
+      if (batch.isComplete()) {
+        sentMessageBatches.splice(i, 1);
+        i--;
+      }
+    }
   }
 
+  /**
+   * Called when a worker notifies us that it has received one or more messages.
+   * @param messageIds
+   */
   function handleWorkerReceived(messageIds: number[]) {
-    receivedMessageBatches = receivedMessageBatches
-      .map((batch) => {
-        batch.envelopes = batch.envelopes
-          .map((e) => {
-            if (messageIds.includes(e.id)) {
-              return undefined;
-            }
-            return e;
-          })
-          .filter((e) => e !== undefined) as Envelope<WorkerMessage>[];
-
-        if (batch.envelopes.length === 0) {
-          setImmediate(batch.resolve);
-          return undefined;
-        }
-
-        return batch;
-      })
-      .filter((b) => b !== undefined) as MessageBatch[];
+    for (let i = 0; i < sentMessageBatches.length; i++) {
+      const batch = sentMessageBatches[i];
+      batch.markReceived(messageIds);
+      if (batch.isComplete()) {
+        sentMessageBatches.splice(i, 1);
+        i--;
+      }
+    }
   }
 
-  function processControlMessage({
-    workerId,
-    envelope: { message },
-  }: {
-    workerId: number;
-    envelope: Envelope<ControlMessage<WorkerMessage>>;
-  }) {
-    log.enabled && log(`receive from ${workerId}: ${JSON.stringify(message)}`);
+  /**
+   * Sets a new initializer to use when new workers come online.
+   * @param initializer
+   */
+  function initializeWorkersWith(
+    initializer?:
+      | WorkerMessage
+      | (() => WorkerMessage)
+      | (() => Promise<WorkerMessage>)
+      | undefined
+  ) {
+    if (initializer == null) {
+      workerInitializer = undefined;
+    } else if (typeof initializer !== "function") {
+      const initializerAsMessage: WorkerMessage = initializer;
+      initializer = () => Promise.resolve(initializerAsMessage);
+    } else {
+      const initializerAsFunc:
+        | (() => WorkerMessage)
+        | (() => Promise<WorkerMessage>) = initializer;
+      workerInitializer = () => Promise.resolve(initializerAsFunc());
+    }
+  }
 
-    switch (message.__type__) {
+  function on(
+    eventName: PrimaryEvent,
+    listener:
+      | ErrorListener
+      | ReceiveListener<PrimaryMessage>
+      | SendListener<WorkerMessage>
+      | StopListener
+  ): void {
+    emitter.on(eventName, listener);
+  }
+
+  function processSystemMessage(m: PrimaryControlMessageWithWorkerId) {
+    const { workerId, ...rest } = m;
+
+    log.enabled && log(`receive from ${m.workerId}: ${JSON.stringify(rest)}`);
+
+    if (workerId == null) {
+      throw new Error(`Got ${m.type} message from null worker id?`);
+    }
+
+    switch (m.type) {
       case "worker_busy": {
         // This worker is too busy to process the things we sent it.
-        setWorkerState(workerId, "busy");
-        messagesToSend.push(...message.envelopes);
-        scheduleTick();
+        handleWorkerBusy(workerId, m.messageIds);
         break;
       }
       case "worker_processed": {
-        handleWorkerProcessed(message.messageIds);
-        setWorkerState(workerId, message.canTakeMore ? "ready" : "busy");
-        scheduleTick();
+        handleWorkerProcessed(m.messageIds);
+        setWorkerState(workerId, m.canTakeMore ? "ready" : "busy");
+        scheduleTick("worker processed");
         break;
       }
       case "worker_ready": {
         setWorkerState(workerId, "ready");
-        scheduleTick();
+        scheduleTick("worker is ready");
         break;
       }
       case "worker_received": {
         // This worker is taking on some of the messages we've sent it!
-        handleWorkerReceived(message.messageIds);
-        setWorkerState(workerId, message.canTakeMore ? "ready" : "busy");
-        scheduleTick();
+        handleWorkerReceived(m.messageIds);
+        setWorkerState(workerId, m.canTakeMore ? "ready" : "busy");
+        scheduleTick("received messages");
         break;
       }
     }
   }
 
-  function processMessage(m: PrimaryMessage): Promise<unknown> {
-    if (!primary) {
-      throw new Error("primary not available");
+  function executeHandlers(m: PrimaryMessage): Promise<void> {
+    const handlers = messageHandlers[m.type];
+    if (!handlers || handlers.length === 0) {
+      return Promise.resolve();
     }
 
-    let promise: Promise<unknown>;
-
-    try {
-      promise = Promise.resolve(
-        primary.handle(m, { sendToPrimary, sendToWorker })
-      );
-    } catch (err: any) {
-      promise = Promise.reject(err);
-    }
-
-    return promise.catch((err) => {
-      log("Error processing message for primary");
-      log(m);
-      log(err);
-      throw err;
-    });
-  }
-
-  function scheduleTick() {
-    if (!tickImmediate) {
-      setImmediate(tick);
-    }
-  }
-
-  function sendToPrimary(message: PrimaryMessage | PrimaryMessage[]) {
-    const messages = Array.isArray(message) ? message : [message];
-    messagesToProcess.push(
-      ...messages.map((message) => ({ envelope: envelope(message) }))
+    return handlers.reduce<Promise<void>>(
+      (p, handler) =>
+        p.then(() => {
+          try {
+            return Promise.resolve(handler(m));
+          } catch (err: any) {
+            return Promise.reject(err);
+          }
+        }),
+      Promise.resolve()
     );
-    scheduleTick();
   }
 
-  function sendToWorker(message: WorkerMessage) {
-    messagesToSend.push(envelope(message));
-    scheduleTick();
+  function scheduleTick(reason: string, delay?: number) {
+    if (delay == null) {
+      // Schedule w/o any delay
+      if (tickTimeout) {
+        clearTimeout(tickTimeout);
+        tickTimeout = undefined;
+        nextTickDelay = undefined;
+      }
+      if (!tickImmediate) {
+        tickImmediate = setImmediate(tick);
+        start();
+      }
+      return;
+    }
+
+    if (tickImmediate) {
+      return;
+    }
+
+    const alreadyHaveDelay = !!tickTimeout;
+    const thisDelayIsSooner = nextTickDelay == null || delay < nextTickDelay;
+
+    if (!alreadyHaveDelay || thisDelayIsSooner) {
+      if (tickTimeout) {
+        clearTimeout(tickTimeout);
+        tickTimeout = undefined;
+      }
+      tickTimeout = setTimeout(tick, delay);
+      start();
+    }
+  }
+
+  function sendControlMessagesToPrimary(
+    messages: Omit<PrimaryControlMessage<PrimaryMessage>, "id">[]
+  ) {
+    if (messages.length === 0) {
+      return;
+    }
+    messagesToProcess.push(
+      ...messages.map(
+        (m) =>
+          ({
+            ...m,
+            id: nextMessageId++,
+          } as PrimaryControlMessage<PrimaryMessage>)
+      )
+    );
+    scheduleTick("send control messages to primary");
+  }
+
+  function sendControlMessagesToWorkers(
+    messages: Omit<WorkerControlMessage<WorkerMessage>, "id">[]
+  ): MessageBatch {
+    if (messages.length === 0) {
+      return createMessageBatch([]);
+    }
+
+    const messagesWithIds = messages.map((m) => ({
+      ...m,
+      id: nextMessageId++,
+    }));
+
+    messagesToSend.push(...messagesWithIds);
+
+    const batch = createMessageBatch(messagesWithIds);
+
+    sentMessageBatches.push(batch);
+
+    scheduleTick("sendControlMessagesToWorkers");
+
+    return batch;
+  }
+
+  /**
+   * Allows the primary to send itself a message.
+   * @param message
+   */
+  function sendToPrimary(messages: PrimaryMessage | PrimaryMessage[]) {
+    sendControlMessagesToPrimary(
+      (Array.isArray(messages) ? messages : [messages]).map((message) => ({
+        type: "message",
+        message,
+      }))
+    );
   }
 
   /**
@@ -359,67 +433,56 @@ export function runPrimary<
    * when _all_ messages have been received by a worker.
    * @param messages
    */
-  function sendToWorkers(
-    messages: WorkerMessage[] | WorkerMessage
-  ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (primaryState === "interrupted") {
-        reject(
-          new Error("Can't send to workers after stop() has been called.")
-        );
-        return;
-      }
-
-      const envelopes = (Array.isArray(messages) ? messages : [messages]).map(
-        envelope
-      );
-
-      if (envelopes.length === 0) {
-        resolve();
-        return;
-      }
-
-      messagesToSend.push(...envelopes);
-
-      receivedMessageBatches.push({
-        envelopes,
-        reject,
-        resolve,
-      });
-
-      scheduleTick();
-    });
+  function sendToWorkers(messages: WorkerMessage[] | WorkerMessage) {
+    sendControlMessagesToWorkers(
+      (Array.isArray(messages) ? messages : [messages]).map((message) => ({
+        type: "message",
+        message,
+      }))
+    );
   }
 
   function sendToWorkersAndWaitForProcessing(
     messages: WorkerMessage[] | WorkerMessage
   ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (primaryState === "interrupted") {
-        reject(
-          new Error("Can't send to workers after stop() has been called.")
-        );
-      }
+    const batch = sendControlMessagesToWorkers(
+      (Array.isArray(messages) ? messages : [messages]).map((message) => ({
+        type: "message",
+        message,
+      }))
+    );
 
-      const envelopes = (Array.isArray(messages) ? messages : [messages]).map(
-        envelope
-      );
+    return batch.allProcessed();
+  }
 
-      if (envelopes.length === 0) {
-        resolve();
-        return;
-      }
+  function sendToWorkersAndWaitForReceipt(
+    messages: WorkerMessage | WorkerMessage[]
+  ): Promise<void> {
+    const batch = sendControlMessagesToWorkers(
+      (Array.isArray(messages) ? messages : [messages]).map((message) => ({
+        type: "message",
+        message,
+      }))
+    );
+    return batch.allReceived();
+  }
 
-      messagesToSend.push(...envelopes);
+  function sendToWorkerAndWaitForProcessing(
+    workerId: number,
+    messages: WorkerMessage | WorkerMessage[]
+  ): Promise<void> {
+    const controlMessages = (
+      Array.isArray(messages) ? messages : [messages]
+    ).map<WorkerControlMessageWithWorkerId>((message) => ({
+      workerId,
+      id: nextMessageId++,
+      type: "message",
+      message,
+    }));
 
-      processedMessageBatches.push({
-        envelopes,
-        reject,
-        resolve,
-      });
-
-      scheduleTick();
-    });
+    const batch = createMessageBatch(controlMessages);
+    messagesToSend.push(...controlMessages);
+    return batch.allProcessed();
   }
 
   function setPrimaryState(state: PrimaryState) {
@@ -443,7 +506,7 @@ export function runPrimary<
    * Forks new workers up to our limit.
    */
   function spawnWorkers() {
-    if (primaryState === "interrupted") {
+    if (primaryState !== "started") {
       return;
     }
 
@@ -464,9 +527,49 @@ export function runPrimary<
     }
   }
 
-  function stop(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      setPrimaryState("interrupted");
+  function start() {
+    if (primaryState !== "not_started") {
+      return;
+    }
+
+    cluster.on("disconnect", handleDisconnect);
+    cluster.on("online", handleOnline);
+    cluster.on("message", handleMessage);
+    process.on("SIGINT", handleSigInt);
+
+    setPrimaryState("started");
+  }
+
+  function stop(force?: boolean): Promise<void> {
+    if (primaryState === "stopped") {
+      if (!stoppingPromise) {
+        throw new Error("No promise available");
+      }
+      return stoppingPromise;
+    }
+
+    if (primaryState === "stopping") {
+      if (!stoppingPromise) {
+        throw new Error("No stopping promise available");
+      }
+
+      if (force !== true) {
+        // We're not forcing, so we can piggy-back on the existing stopping promise
+        return stoppingPromise;
+      }
+    }
+
+    setPrimaryState("stopping");
+
+    if (force !== true && stoppingPromise) {
+      return stoppingPromise;
+    }
+
+    stoppingPromise = new Promise((resolve) => {
+      if (force) {
+        justStop();
+        return;
+      }
 
       tryToStop();
 
@@ -478,6 +581,10 @@ export function runPrimary<
           return;
         }
 
+        justStop();
+      }
+
+      function justStop() {
         process.off("message", handleMessage);
         cluster.off("online", handleOnline);
         cluster.off("disconnect", handleDisconnect);
@@ -486,8 +593,13 @@ export function runPrimary<
           clearImmediate(tickImmediate);
           tickImmediate = undefined;
         }
+
+        setPrimaryState("stopped");
+        resolve();
       }
     });
+
+    return stoppingPromise;
   }
 
   /**
@@ -497,139 +609,128 @@ export function runPrimary<
   function tick() {
     tickImmediate = undefined;
 
-    // Send any control messages we need to
-    if (primaryState !== "interrupted") {
-      while (controlMessagesToSend.length > 0) {
-        const m = controlMessagesToSend.shift();
-        if (!m) {
-          throw new Error("null entry in controlMessagesToSend");
+    const [userMessages, systemMessages] = messagesToProcess.reduce<
+      [PrimaryControlMessageWithWorkerId[], PrimaryControlMessageWithWorkerId[]]
+    >(
+      ([user, system], message) => {
+        if (message.type === "message") {
+          user.push(message);
+        } else {
+          system.push(message);
         }
 
-        // control messages have to be sent to a specific worker
-        const worker = cluster.workers && cluster.workers[m.workerId];
-        if (!worker) {
-          log(
-            `[${
-              m.workerId
-            }] Attempting to send control message to nonexisting worker: ${JSON.stringify(
-              m
-            )}`
-          );
-          continue;
-        }
+        return [user, system];
+      },
+      [[], []]
+    );
 
-        worker.send(m, (err) => {
-          if (err) {
-            log(`[${m.workerId}] Error sending message`, err);
-            controlMessagesToSend.push(m);
-            scheduleTick();
-          }
-        });
-      }
-    }
+    messagesToProcess.splice(0, messagesToProcess.length);
 
-    // Process any control messages we've received.
-    // (We always handle control messages, even if we're shutting down.)
-    if (controlMessagesToProcess.length > 0) {
-      const m = controlMessagesToProcess.shift();
-      if (!m) {
-        throw new Error("null entry in controlMessagesToProcess");
-      }
-      processControlMessage(m);
-      scheduleTick();
-      return;
-    }
+    // Process system messages first, since they do things like tell us
+    // what workers are currently available.
+    systemMessages.forEach(processSystemMessage);
 
     // Then, process any messages we've received, one at a time.
-    if (primaryState !== "processing" && messagesToProcess.length > 0) {
-      const m = messagesToProcess.shift();
-      if (!m) {
-        throw new Error("null entry in messagesToProcess");
-      }
-      const prevPrimaryState = primaryState;
-      setPrimaryState("processing");
+    if (userMessages.length > 0) {
+      userMessages
+        .reduce<Promise<void>>(
+          (p, message) =>
+            p.then(() => {
+              // (It's possible we were stopped during processing)
+              if (primaryState !== "started") {
+                return;
+              }
 
-      log.enabled &&
-        log(`receive from ${m.workerId}: ${JSON.stringify(m.envelope)}`);
+              if (message.type !== "message") {
+                throw new Error("Message type changed out from under us");
+              }
 
-      processMessage(m.envelope.message).then(() => {
-        if (primaryState === "processing") {
-          setPrimaryState(prevPrimaryState);
-        }
-        scheduleTick();
-      });
-      return;
-    }
-
-    if (primaryState === "interrupted") {
-      // We've been interrupted, so we're not sending any more messages
-      // to our workers.
-      return;
+              return executeHandlers(message.message)
+                .catch((err) => {
+                  log(`Error processing #${message.id}`);
+                  log(err);
+                })
+                .then(() => {});
+            }),
+          Promise.resolve()
+        )
+        .then(() => {
+          if (primaryState === "started") {
+            scheduleTick("after process user messages");
+          }
+        });
     }
 
     // Finally, send messages we've got queued up to our workers.
-    if (messagesToSend.length > 0) {
-      let readyWorkers = Object.keys(workerStates).filter(
-        (id) => workerStates[Number(id)] === "ready"
-      );
+    if (messagesToSend.length === 0) {
+      return;
+    }
 
-      if (readyWorkers.length === 0) {
-        // We don't have any workers we can send to.
-        // So let's send to all of them and let them tell us whether they
-        // are still busy.
-        readyWorkers = Object.keys(workerStates);
-      }
+    const allWorkerIds = Object.keys(workerStates).map((id) => Number(id));
 
-      if (readyWorkers.length === 0) {
-        // We dont' have any workers to actually do any work
-        scheduleTick();
+    if (allWorkerIds.length === 0) {
+      // We don't have any workers ready.
+      spawnWorkers();
+      scheduleTick("no workers", 500);
+      return;
+    }
+
+    let readyWorkers = allWorkerIds.filter(
+      (id) => workerStates[id] === "ready"
+    );
+
+    if (readyWorkers.length === 0) {
+      // We don't have any workers we can send to.
+      // So let's send to all of them and let them tell us whether they
+      // are too busy.
+      readyWorkers = allWorkerIds;
+    }
+
+    const unsendableMessages: typeof messagesToSend = [];
+
+    messagesToSend.forEach((m) => {
+      const workerId =
+        m.workerId ??
+        readyWorkers[Math.floor(Math.random() * readyWorkers.length)];
+      const worker = cluster.workers && cluster.workers[workerId];
+
+      if (!worker) {
+        // We think we have a worker that is not actually online. This implies
+        // that we've gone out-of-date w/r/t Node's cluster.
+        log(`[${workerId}] worker id does not exist`);
+        unsendableMessages.push(m);
         return;
       }
 
-      while (messagesToSend.length > 0) {
-        const envelope = messagesToSend.shift();
-        if (!envelope) {
-          throw new Error("null entry in messagesToSend");
-        }
+      log(`send to ${workerId}: ${JSON.stringify(m)}`);
 
-        const workerId =
-          readyWorkers[Math.floor(Math.random() * readyWorkers.length)];
-        const worker = cluster.workers && cluster.workers[workerId];
+      worker.send(m, (err) => {
+        if (err) {
+          // An error during send probably means a worker died?
+          log(`[${workerId}] Error sending message to worker`, err);
 
-        if (!worker) {
-          // We think we have a worker that is not actually online. This implies
-          // that we've gone out-of-date w/r/t Node's cluster. So quietly put
-          // the message back on the queue and start over
-          log(`[${workerId}] worker id does not exist`);
-          messagesToSend.unshift(envelope);
-          scheduleTick();
+          delete sentMessagesById[m.id];
+          messagesToSend.push(m);
+
+          scheduleTick("error during send to worker");
           return;
         }
+      });
 
-        log(`send to ${workerId}: ${JSON.stringify(envelope)}`);
+      sentMessagesById[m.id] = {
+        message: m,
+        state: "sent",
+      };
+    });
 
-        worker.send(envelope, (err) => {
-          if (err) {
-            // An error during send probably means a worker died?
-            log(`[${workerId}] Error sending message to worker`, err);
-            messagesToSend.push(envelope);
-            scheduleTick();
-            return;
-          }
-        });
-      }
+    messagesToSend.splice(0, messagesToSend.length);
+    messagesToSend.push(...unsendableMessages);
+    if (messagesToSend.length > 0) {
+      scheduleTick("have messages to send");
     }
   }
 
   function workersWanted(): number {
-    if (options.workerCount == null) {
-      return os.cpus().length;
-    }
-
-    if (typeof options.workerCount === "function") {
-      return options.workerCount();
-    }
-
-    return options.workerCount;
+    return os.cpus().length;
   }
 }

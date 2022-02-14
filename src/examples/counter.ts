@@ -1,18 +1,17 @@
-import * as framework from "..";
+import crypto from "crypto";
+import * as fc from "..";
 import { Primary, Worker } from "../types";
 
-// This example creates a program that counts from 0 - 1,000,000, spreading the
-// actual counting across as many workers as possible.
-
-type StartCountingMessage = {
-  type: "start_counting";
-  from: number;
-  to: number;
+type CountMessage = {
+  type: "count";
+  number: number;
 };
 
 type CountedMessage = {
   type: "counted";
   number: number;
+  input: string;
+  hash: string;
 };
 
 run().catch((err) => {
@@ -21,91 +20,90 @@ run().catch((err) => {
 });
 
 async function run() {
-  let nextBatchStart = 0;
-  const { sendToWorkers } = framework.run({
-    createPrimary,
-    createWorker,
+  const instance = fc.start<CountedMessage, CountMessage>();
+
+  if (instance.role === "primary") {
+    runPrimary(instance);
+  } else {
+    runWorker(instance);
+  }
+}
+
+async function runPrimary({
+  handle,
+  sendToWorkersAndWaitForReceipt,
+}: Primary<CountedMessage, CountMessage>): Promise<void> {
+  let number = 0;
+
+  handle("counted", (m) => {
+    console.log(m.number, m.input, m.hash);
   });
 
-  if (sendToWorkers) {
-    // We are the primary, and we can send messages to our workers.
-    sendNextBatch();
-  }
-
-  function sendNextBatch() {
-    if (!sendToWorkers) {
-      return;
-    }
-
-    const BATCH_SIZE = 10000;
-    const MAX = 1000000;
-
-    if (nextBatchStart >= MAX) {
-      return;
-    }
-
-    const from = nextBatchStart;
-    const to = from + BATCH_SIZE - 1;
-
-    nextBatchStart = from + BATCH_SIZE;
-
-    sendToWorkers({
-      type: "start_counting",
-      from,
-      to,
-    }).then(() => {
-      setImmediate(sendNextBatch);
+  while (true) {
+    number++;
+    await sendToWorkersAndWaitForReceipt({
+      type: "count",
+      number,
     });
   }
 }
 
-function createPrimary(): Primary<CountedMessage, StartCountingMessage> {
-  return {
-    handle(m: CountedMessage): Promise<void> {
-      console.log(m.number);
-      return Promise.resolve();
-    },
+function runWorker({
+  handle,
+  addBusyCheck,
+  sendToPrimary,
+}: Worker<CountedMessage, CountMessage>) {
+  let busy = false;
 
-    initializeWorker() {
-      console.log("initializeWorker");
-      return Promise.resolve();
-    },
+  const ITERATIONS = 1000;
 
-    parseMessage(m: unknown): CountedMessage | undefined {
-      return m ? (m as CountedMessage) : undefined;
-    },
-  };
-}
+  handle("count", (m) => {
+    try {
+      busy = true;
 
-function createWorker(): Worker<CountedMessage, StartCountingMessage> {
-  let interval: NodeJS.Timer | undefined;
+      while (true) {
+        const values = new Uint8Array(m.number);
+        for (let i = 0; i < m.number; i++) {
+          values[i] = Math.floor(Math.random() * 255);
+        }
 
-  return {
-    handle(m: StartCountingMessage, { sendToPrimary }): Promise<void> {
-      return new Promise((resolve, reject) => {
-        let number = m.from;
-        interval = setInterval(() => {
-          if (number >= m.to) {
-            interval && clearInterval(interval);
-            interval = undefined;
-            resolve();
-            return;
-          }
+        let buffer = Buffer.from(values);
+        const input = buffer.toString("hex");
 
+        for (let i = 0; i < ITERATIONS; i++) {
+          const hash = crypto.createHash("sha512");
+          hash.update(buffer);
+          buffer = hash.digest();
+        }
+
+        const hash = buffer.toString("hex");
+
+        const product = hash
+          .split("")
+          .map((digit) => parseInt(digit, 16))
+          .reduce<number>((value, digit) => {
+            return value * (digit === 0 ? 1 : digit);
+          }, 1);
+
+        const remainder = product % m.number;
+
+        // console.error("%d %% %d = %d", product, m.number, remainder);
+
+        if (remainder === 0) {
           sendToPrimary({
             type: "counted",
-            number,
+            number: m.number,
+            input,
+            hash,
           });
+          break;
+        }
+      }
+    } finally {
+      busy = false;
+    }
+  });
 
-          number++;
-        }, 100);
-      });
-    },
-    isBusy() {
-      return !!interval;
-    },
-    parseMessage(m: unknown): StartCountingMessage | undefined {
-      return m ? (m as StartCountingMessage) : undefined;
-    },
-  };
+  // We are busy we have one count going
+  addBusyCheck(() => busy);
 }

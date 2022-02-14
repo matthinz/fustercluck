@@ -1,142 +1,182 @@
-export type SendToWorker<WorkerMessage> = (m: WorkerMessage) => void;
+import child from "child_process";
 
-export type SendToPrimary<PrimaryMessage> = (m: PrimaryMessage) => void;
-
-export type Envelope<Message> = {
-  id: number;
-  message: Message;
-};
-
-export type DispatchOptions<PrimaryMessage, WorkerMessage> = {
-  sendToWorker: SendToWorker<WorkerMessage>;
-  sendToPrimary: SendToPrimary<PrimaryMessage>;
-};
-
-export type PrimaryHandleOptions<PrimaryMessage, WorkerMessage> =
-  DispatchOptions<PrimaryMessage, WorkerMessage>;
-
-export type WorkerHandleOptions<PrimaryMessage> = {
-  sendToPrimary: SendToPrimary<PrimaryMessage>;
-};
-
-export type InitializeWorkerOptions<PrimaryMessage, WorkerMessage> = {
-  sendToWorker: SendToWorker<WorkerMessage>;
-};
-
-export type Primary<PrimaryMessage, WorkerMessage> = {
-  /**
-   * Handle is called with a message to be processed.
-   * If implementations return a Promise, no additional messages will be
-   * handled until the Promise resolves.
-   */
-  handle(
-    m: PrimaryMessage,
-    options: PrimaryHandleOptions<PrimaryMessage, WorkerMessage>
-  ): void | Promise<unknown>;
-
-  /**
-   * If defined, initializeWorker is called when a new worker comes online.
-   * No additional messages will be sent to the worker until all messages
-   * sent during initialization have been processed.
-   */
-  initializeWorker?: (
-    options: InitializeWorkerOptions<PrimaryMessage, WorkerMessage>
-  ) => Promise<unknown> | void;
-
-  /**
-   * Converts unknown input into a strongly-typed message.
-   * @param m
-   */
-  parseMessage(m: unknown): PrimaryMessage | undefined;
-
-  /**
-   * shouldDispatch provides a synchronous hook that can be used to delay the
-   * dispatching of a particular message to a worker.
-   * @returns `true` to proceed with dispatching, or a number indicating the milliseconds to delay before processing
-   */
-  shouldDispatch?: (m: PrimaryMessage) => boolean | number;
-};
-
-export type Worker<PrimaryMessage, WorkerMessage> = {
-  /**
-   * Handle is called to process messages sent to this worker.
-   * @param m
-   * @param options
-   */
-  handle(m: WorkerMessage, options: WorkerHandleOptions<PrimaryMessage>): void;
-
-  /**
-   * isBusy() indicates whether this worker can accept additional messages.
-   * It will be called repeatedly.
-   */
-  isBusy(): boolean;
-
-  /**
-   * Converts unknown input into a strongly-typed message.
-   * @param m
-   */
-  parseMessage(m: unknown): WorkerMessage | undefined;
-};
+export type MessageBase = {
+  type: string;
+} & child.Serializable;
 
 /**
- * These options are passed to run() to start the app.
+ * A map of message types to sets of functions registered to handle messages of that type.
  */
-export type RunOptions<PrimaryMessage, WorkerMessage> = {
-  /**
-   * Time (in ms) that is allowed to elapse between checks to see if a
-   * busy worker is still so.
-   */
-  busyWorkerCheckupInterval?: number | (() => number);
-
-  /**
-   * Factory function used to create the Primary instance.
-   */
-  createPrimary: () =>
-    | Promise<Primary<PrimaryMessage, WorkerMessage>>
-    | Primary<PrimaryMessage, WorkerMessage>;
-
-  /**
-   * Factory function used to create the Worker instance.
-   */
-  createWorker: () =>
-    | Promise<Worker<PrimaryMessage, WorkerMessage>>
-    | Worker<PrimaryMessage, WorkerMessage>;
-
-  /**
-   * Number of worker processes to span. Defaults to the number of CPUs on
-   * the current machine.
-   */
-  workerCount?: number | (() => number);
+export type MessageHandlers<Message extends MessageBase> = {
+  [MessageType in Message["type"] as string]: ((
+    m: Message & { type: MessageType }
+  ) => void | Promise<void>)[];
 };
 
-export type RunResult<PrimaryMessage, WorkerMessage> = {
-  /**
-   * Allows the primary to send a message to itself.
-   */
-  sendToPrimary?: (messages: PrimaryMessage | PrimaryMessage[]) => void;
+type WorkerMessageHandler<PrimaryMessage, WorkerMessage> = (
+  m: WorkerMessage
+) => void | Promise<void>;
+
+type PrimaryMessageHandler<PrimaryMessage, WorkerMessage> = (
+  m: PrimaryMessage
+) => void | Promise<void>;
+
+export type WorkerError = {
+  code?: string;
+  message: string;
+  stack?: string;
+};
+
+export type Primary<
+  PrimaryMessage extends MessageBase,
+  WorkerMessage extends MessageBase
+> = {
+  role: "primary";
 
   /**
-   * Sends a batch of messages to workers and returns a Promise that resolves
-   * once workers have confirmed receipt of the messages.
+   * Adds a handler for messages of the given type.
+   * @param type Message type to handle.
+   * @param handler Handler function. This function may return a Promise.
+   */
+  handle<MessageType extends PrimaryMessage["type"]>(
+    messageType: MessageType,
+    handler: PrimaryMessageHandler<
+      PrimaryMessage & { type: MessageType },
+      WorkerMessage
+    >
+  ): void;
+
+  /**
+   * Specifies how to initialize workers.
+   * @param initializer Either a message to send, or a function that returns a message to send.
+   */
+  initializeWorkersWith(
+    initializer:
+      | WorkerMessage
+      | (() => WorkerMessage)
+      | (() => Promise<WorkerMessage>)
+  ): void;
+
+  /**
+   * Adds a handler for the "error" event, which fires whenever an error
+   * is encountered while a worker is handling a message.
+   * @param eventName
+   * @param handler
+   */
+  on(eventName: "error", handler: (err: WorkerError) => void): void;
+
+  /**
+   * Adds a handler for the "receive" event, which fires when the primary
+   * receives a new message.
+   * @param eventName
+   * @param handler
+   */
+  on(eventName: "receive", handler: (m: PrimaryMessage) => void): void;
+
+  /**
+   * Adds a handler for the "send" event, which fires when the primary sends
+   * a message to a worker.
+   * @param eventName
+   * @param handler
+   */
+  on(eventName: "send", handler: (m: WorkerMessage) => void): void;
+
+  /**
+   * Adds a handler for the "stop" event, which fires when the primary is
+   * stopping its processing.
+   * @param eventName
+   * @param handler
+   */
+  on(eventName: "stop", handler: () => void): void;
+
+  /**
+   * Puts one or more on the processing queue for the Primary.
    * @param messages
    */
-  sendToWorkers?: (messages: WorkerMessage | WorkerMessage[]) => Promise<void>;
+  sendToPrimary(messages: PrimaryMessage | PrimaryMessage[]): void;
 
   /**
-   * Stops the running primary or worker.
-   */
-  stop(): Promise<void>;
-};
-
-export type PrimaryRunResult<PrimaryMessage, WorkerMessage> = RunResult<
-  PrimaryMessage,
-  WorkerMessage
-> & {
-  /**
-   * Sends the given messages to workers and returns a promise that resolves
-   * once the send has been completed.
-   *
+   * Dispatches one or more messages to workers.
    * @param messages
    */
-  sendToWorkers(messages: WorkerMessage[]): Promise<void>;
+  sendToWorkers(messages: WorkerMessage | WorkerMessage[]): void;
+
+  /**
+   * Dispatches one or more messages to workers.
+   * @param messages
+   * @returns A Promise that resolves once all messages have been _received_ by a worker.
+   */
+  sendToWorkersAndWaitForReceipt(
+    messages: WorkerMessage | WorkerMessage[]
+  ): Promise<void>;
+
+  /**
+   * Dispatches one or more messages to workers.
+   * @param messages
+   * @returns A Promise that resolves once all messages have been _processed_ by a worker.
+   */
+  sendToWorkersAndWaitForProcessing(
+    messages: WorkerMessage | WorkerMessage[]
+  ): Promise<void>;
+
+  /**
+   * Stops processing. If force is `true`, any running workers will be forcibly
+   * disconnected. Otherwise `stop` will wait for any messages currently being
+   * processed to complete before disconnecting them.
+   * @returns A Promise that resolves once all workers have been disconnected.
+   */
+  stop(force?: boolean): Promise<void>;
 };
+
+export type Worker<
+  PrimaryMessage extends MessageBase,
+  WorkerMessage extends MessageBase
+> = {
+  role: "worker";
+
+  /**
+   * @param check A function that returns whether this worker is currently "busy".
+   */
+  addBusyCheck(check: () => boolean): void;
+
+  /**
+   * Adds a handler for messages of the given type.
+   * @param type Message type to handle.
+   * @param handler Handler function. This function may return a Promise.
+   */
+  handle<MessageType extends WorkerMessage["type"]>(
+    messageType: MessageType,
+    handler: WorkerMessageHandler<
+      PrimaryMessage,
+      WorkerMessage & { type: MessageType }
+    >
+  ): void;
+
+  /**
+   * Sends one or more messages to the primary.
+   * @param messages
+   */
+  sendToPrimary(messages: PrimaryMessage | PrimaryMessage[]): void;
+};
+
+export type StartOptions<
+  PrimaryMessage extends MessageBase,
+  WorkerMessage extends MessageBase
+> = {
+  /**
+   * Function used to attempt to parse unknown input into a strongly-typed message for the Primary.
+   */
+  parsePrimaryMessage?: (m: unknown) => PrimaryMessage | undefined;
+
+  /**
+   * Function used to attempt to parse unknown input into a strongly-typed message for the Worker.
+   */
+  parseWorkerMessage?: (m: unknown) => WorkerMessage | undefined;
+};
+
+export type StartResult<
+  PrimaryMessage extends MessageBase,
+  WorkerMessage extends MessageBase
+> =
+  | Primary<PrimaryMessage, WorkerMessage>
+  | Worker<PrimaryMessage, WorkerMessage>;
