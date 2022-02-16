@@ -1,12 +1,11 @@
-import cluster from "cluster";
-import { MessageBase, MessageHandlers, StartOptions, Worker } from "./types";
 import debug from "debug";
+import { createClusterDriver } from "./driver";
+import { MessageBase, MessageHandlers, StartOptions, Worker } from "./types";
 import {
   parseWorkerControlMessage,
   PrimaryControlMessage,
   WorkerControlMessage,
 } from "./messages";
-import { type } from "os";
 
 // Interval used to debounce notifications to the primary about messages we've processed
 const NOTIFY_PRIMARY_OF_PROCESSED_DEBOUNCE_INTERVAL = 250;
@@ -22,7 +21,9 @@ export function startWorker<
 >(
   options?: StartOptions<PrimaryMessage, WorkerMessage>
 ): Worker<PrimaryMessage, WorkerMessage> {
-  const log = debug(`fustercluck:worker:${cluster.worker?.id}`);
+  const driver = options?.driver ?? createClusterDriver();
+
+  const log = debug(`fustercluck:worker:${driver.getWorkerId()}`);
 
   /**
    * workerState tracks the current state of this worker.
@@ -114,10 +115,14 @@ export function startWorker<
     const parsed = parseWorkerControlMessage(m, options?.parseWorkerMessage);
 
     if (parsed == null) {
+      log.enabled && log(`INVALID MESSAGE: ${JSON.stringify(m)}`);
       return;
     }
 
+    log.enabled && log(`ENQUEUE: ${parsed.id}`);
+
     messagesToProcess.push(parsed);
+
     scheduleTick();
   }
 
@@ -178,7 +183,8 @@ export function startWorker<
       return;
     }
 
-    process.on("message", handleMessage);
+    driver.on("messageFromPrimary", handleMessage);
+
     workerState = "started";
   }
 
@@ -233,20 +239,15 @@ export function startWorker<
     systemMessagesToProcess.forEach((m) => processControlMessage);
 
     // Send everything we can back to the primary
-    const { send } = process;
-    if (!send) {
-      throw new Error("process.send is not available");
-    }
-
     messagesToSend.forEach((m) => {
       log.enabled && log(`send to primary: ${JSON.stringify(m)}`);
-      send.call(process, m, undefined, undefined, (err) => {
-        if (err) {
+      driver
+        .sendToPrimary(m)
+        .catch((err) => {
           log("Error sending message", err, m);
           messagesToSend.push(m);
-        }
-        scheduleTick();
-      });
+        })
+        .finally(scheduleTick);
     });
     messagesToSend.splice(0, messagesToSend.length);
 
@@ -259,7 +260,7 @@ export function startWorker<
       m = userMessagesToProcess.shift()
     ) {
       if (m.type !== "message") {
-        throw new Error();
+        throw new Error(`Invalid message type for #${m.id}`);
       }
       const controlMessage = m;
       const { id, message } = m;
@@ -267,10 +268,10 @@ export function startWorker<
       receivedMessageIds.push(id);
 
       log.enabled && log(`BEGIN processing ${id}: ${JSON.stringify(message)}`);
+
       executeHandlers(message)
         .then(() => {
           processedMessageIds.push(id);
-          notifyPrimaryOfProcessedMessages();
         })
         .catch((err: any) => {
           log(`ERROR processing ${id}`, err);
@@ -280,30 +281,33 @@ export function startWorker<
         .finally(() => {
           log.enabled &&
             log(`END processing ${id}: ${JSON.stringify(message)}`);
+          notifyPrimaryOfProcessedMessages();
         });
     }
 
     // Any user messages left are ones we couldn't handle because we were
     // too busy. Tell the primary about these ones.
     if (userMessagesToProcess.length > 0) {
-      messagesToSend.push({
-        id: nextMessageId++,
-        type: "worker_busy",
-        messageIds: userMessagesToProcess.map(({ id }) => id),
-      });
-      scheduleTick();
+      sendToControlMessagesToPrimary([
+        {
+          type: "worker_busy",
+          id: nextMessageId++,
+          messageIds: userMessagesToProcess.map(({ id }) => id),
+        },
+      ]);
     }
 
     // Finally, schedule a message send to the primary to tell it about
     // the messages we've received so far.
     if (receivedMessageIds.length > 0) {
-      messagesToSend.push({
-        type: "worker_received",
-        id: nextMessageId++,
-        messageIds: receivedMessageIds,
-        canTakeMore: !isBusy(),
-      });
-      scheduleTick();
+      sendToControlMessagesToPrimary([
+        {
+          type: "worker_received",
+          id: nextMessageId++,
+          messageIds: receivedMessageIds,
+          canTakeMore: !isBusy(),
+        },
+      ]);
     }
   }
 }

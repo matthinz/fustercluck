@@ -1,9 +1,9 @@
-import { spawn } from "child_process";
-import cluster, { Worker as ClusterWorker } from "cluster";
 import debug from "debug";
 import { EventEmitter } from "events";
 import os from "os";
 import { createMessageBatch, MessageBatch } from "./batch";
+import { createClusterDriver } from "./driver";
+import { Driver } from "./driver/types";
 import {
   parsePrimaryControlMessage,
   PrimaryControlMessage,
@@ -38,10 +38,10 @@ export function startPrimary<
   options?: StartOptions<PrimaryMessage, WorkerMessage>
 ): Primary<PrimaryMessage, WorkerMessage> {
   type PrimaryControlMessageWithWorkerId =
-    PrimaryControlMessage<PrimaryMessage> & { workerId?: number };
+    PrimaryControlMessage<PrimaryMessage> & { workerId?: string };
 
   type WorkerControlMessageWithWorkerId =
-    WorkerControlMessage<WorkerMessage> & { workerId?: number };
+    WorkerControlMessage<WorkerMessage> & { workerId?: string };
 
   type SentWorkerMessage = {
     message: WorkerControlMessage<WorkerMessage>;
@@ -49,6 +49,8 @@ export function startPrimary<
   };
 
   const log = debug(`fustercluck:primary`);
+
+  const driver = options?.driver ?? createClusterDriver();
 
   const messageHandlers = {} as MessageHandlers<PrimaryMessage>;
 
@@ -75,7 +77,7 @@ export function startPrimary<
   let nextTickDelay: number | undefined;
 
   // `workerStates` is a dictionary linking worker id to the associated state.
-  const workerStates: { [id: number]: WorkerState } = {};
+  const workerStates: { [id: string]: WorkerState } = {};
 
   const emitter = new EventEmitter();
 
@@ -110,20 +112,13 @@ export function startPrimary<
     messageHandlers[type] = handlers;
   }
 
-  function handleDisconnect(worker: ClusterWorker) {
-    log(`[${worker.id}] disconnect`);
-
-    delete workerStates[worker.id];
-    spawnWorkers();
-  }
-
   /**
    * Handles a new message coming in from a worker.
    * @param worker
    * @param input
    * @returns
    */
-  function handleMessage(worker: ClusterWorker, input: unknown) {
+  function handleMessage(workerId: string, input: unknown) {
     const message = parsePrimaryControlMessage(
       input,
       options?.parsePrimaryMessage
@@ -135,54 +130,10 @@ export function startPrimary<
 
     messagesToProcess.push({
       ...message,
-      workerId: worker.id,
+      workerId,
     });
 
     scheduleTick("got message");
-  }
-
-  /**
-   * Handles a new worker coming online. Performs any initialization required,
-   * then marks the worker as "ready" to be sent messages.
-   */
-  function handleOnline(worker: ClusterWorker) {
-    if (primaryState !== "started") {
-      worker.disconnect();
-      return;
-    }
-
-    const { id } = worker;
-
-    log(`[${id}] online`);
-
-    if (!workerInitializer) {
-      // No initialization is necessary
-      workerStates[id] = "ready";
-      return;
-    }
-
-    workerStates[worker.id] = "initializing";
-
-    // Send an initialization message to the worker, and wait for it to be processed.
-    workerInitializer()
-      .then((message) => sendToWorkerAndWaitForProcessing(id, message))
-      .catch((err) => {
-        log(`[${id}]: Error during initialization`, err);
-        worker.disconnect();
-        return false;
-      })
-      .then((succeeded) => {
-        if (primaryState !== "started") {
-          // Something happened in the interim
-          worker.disconnect();
-          return;
-        }
-
-        if (succeeded && worker.isConnected()) {
-          workerStates[worker.id] = "ready";
-          scheduleTick("worker ready");
-        }
-      });
   }
 
   /**
@@ -199,7 +150,7 @@ export function startPrimary<
     stop();
   }
 
-  function handleWorkerBusy(workerId: number, messageIds: number[]) {
+  function handleWorkerBusy(workerId: string, messageIds: number[]) {
     setWorkerState(workerId, "busy");
 
     if (messageIds.length === 0) {
@@ -222,11 +173,63 @@ export function startPrimary<
     scheduleTick("worker is busy");
   }
 
+  function handleWorkerOffline(workerId: string) {
+    log(`[${workerId}] disconnect`);
+    delete workerStates[workerId];
+    spawnWorkers();
+  }
+
+  /**
+   * Handles a new worker coming online. Performs any initialization required,
+   * then marks the worker as "ready" to be sent messages.
+   */
+  function handleWorkerOnline(workerId: string) {
+    if (primaryState !== "started") {
+      driver.takeWorkerOffline(workerId);
+      return;
+    }
+
+    log(`[${workerId}] online`);
+
+    if (!workerInitializer) {
+      // No initialization is necessary
+      workerStates[workerId] = "ready";
+      return;
+    }
+
+    workerStates[workerId] = "initializing";
+
+    // Send an initialization message to the worker, and wait for it to be processed.
+    workerInitializer()
+      .then((message) => sendToWorkerAndWaitForProcessing(workerId, message))
+      .catch((err) => {
+        log(`[${workerId}]: Error during initialization`, err);
+        driver.takeWorkerOffline(workerId);
+        return false;
+      })
+      .then((succeeded) => {
+        if (primaryState !== "started") {
+          // Something happened in the interim, take offline
+          driver.takeWorkerOffline(workerId);
+          return;
+        }
+
+        if (succeeded) {
+          workerStates[workerId] = "ready";
+          scheduleTick("worker ready");
+        }
+      });
+  }
+
   /**
    * Called when a worker notifies us that it has processed one or more messages.
    * @param messageIds
    */
-  function handleWorkerProcessed(messageIds: number[]) {
+  function handleWorkerProcessed(
+    workerId: string,
+    messageIds: number[],
+    canTakeMore: boolean
+  ) {
     for (let i = 0; i < sentMessageBatches.length; i++) {
       const batch = sentMessageBatches[i];
       batch.markProcessed(messageIds);
@@ -235,13 +238,20 @@ export function startPrimary<
         i--;
       }
     }
+
+    setWorkerState(workerId, canTakeMore ? "ready" : "busy");
+    scheduleTick("worker processed");
   }
 
   /**
    * Called when a worker notifies us that it has received one or more messages.
    * @param messageIds
    */
-  function handleWorkerReceived(messageIds: number[]) {
+  function handleWorkerReceived(
+    workerId: string,
+    messageIds: number[],
+    canTakeMore: boolean
+  ) {
     for (let i = 0; i < sentMessageBatches.length; i++) {
       const batch = sentMessageBatches[i];
       batch.markReceived(messageIds);
@@ -250,6 +260,10 @@ export function startPrimary<
         i--;
       }
     }
+
+    setWorkerState(workerId, canTakeMore ? "ready" : "busy");
+
+    scheduleTick("received messages");
   }
 
   /**
@@ -303,9 +317,8 @@ export function startPrimary<
         break;
       }
       case "worker_processed": {
-        handleWorkerProcessed(m.messageIds);
-        setWorkerState(workerId, m.canTakeMore ? "ready" : "busy");
-        scheduleTick("worker processed");
+        handleWorkerProcessed(workerId, m.messageIds, m.canTakeMore);
+        console.error(sentMessageBatches.toString());
         break;
       }
       case "worker_ready": {
@@ -315,9 +328,7 @@ export function startPrimary<
       }
       case "worker_received": {
         // This worker is taking on some of the messages we've sent it!
-        handleWorkerReceived(m.messageIds);
-        setWorkerState(workerId, m.canTakeMore ? "ready" : "busy");
-        scheduleTick("received messages");
+        handleWorkerReceived(workerId, m.messageIds, m.canTakeMore);
         break;
       }
     }
@@ -468,7 +479,7 @@ export function startPrimary<
   }
 
   function sendToWorkerAndWaitForProcessing(
-    workerId: number,
+    workerId: string,
     messages: WorkerMessage | WorkerMessage[]
   ): Promise<void> {
     const controlMessages = (
@@ -493,7 +504,7 @@ export function startPrimary<
     primaryState = state;
   }
 
-  function setWorkerState(workerId: number, state: WorkerState) {
+  function setWorkerState(workerId: string, state: WorkerState) {
     const currentState = workerStates[workerId];
     if (state === currentState) {
       return;
@@ -517,13 +528,8 @@ export function startPrimary<
       return;
     }
 
-    cluster.setupPrimary({
-      // @ts-ignore
-      serialization: "advanced",
-    });
-
     for (let i = workerCount; i < wanted; i++) {
-      cluster.fork();
+      driver.requestNewWorker();
     }
   }
 
@@ -532,9 +538,10 @@ export function startPrimary<
       return;
     }
 
-    cluster.on("disconnect", handleDisconnect);
-    cluster.on("online", handleOnline);
-    cluster.on("message", handleMessage);
+    driver.on("workerOffline", handleWorkerOffline);
+    driver.on("workerOnline", handleWorkerOnline);
+    driver.on("messageFromWorker", handleMessage);
+
     process.on("SIGINT", handleSigInt);
 
     setPrimaryState("started");
@@ -571,7 +578,20 @@ export function startPrimary<
         return;
       }
 
-      tryToStop();
+      // Wait for all pending batches to resolve
+      let promises = sentMessageBatches.reduce<Promise<void>[]>(
+        (promises, batch) => {
+          promises.push(batch.allProcessed());
+          promises.push(batch.allReceived());
+          return promises;
+        },
+        []
+      );
+
+      Promise.all(promises).then(() => {
+        console.error("sentMessageBatches", sentMessageBatches);
+        tryToStop();
+      });
 
       function tryToStop() {
         const canStop = Object.keys(workerStates).length === 0;
@@ -585,17 +605,14 @@ export function startPrimary<
       }
 
       function justStop() {
-        process.off("message", handleMessage);
-        cluster.off("online", handleOnline);
-        cluster.off("disconnect", handleDisconnect);
+        setPrimaryState("stopped");
 
         if (tickImmediate) {
           clearImmediate(tickImmediate);
           tickImmediate = undefined;
         }
 
-        setPrimaryState("stopped");
-        resolve();
+        driver.stop().then(resolve);
       }
     });
 
@@ -666,7 +683,7 @@ export function startPrimary<
       return;
     }
 
-    const allWorkerIds = Object.keys(workerStates).map((id) => Number(id));
+    const allWorkerIds = Object.keys(workerStates);
 
     if (allWorkerIds.length === 0) {
       // We don't have any workers ready.
@@ -692,29 +709,18 @@ export function startPrimary<
       const workerId =
         m.workerId ??
         readyWorkers[Math.floor(Math.random() * readyWorkers.length)];
-      const worker = cluster.workers && cluster.workers[workerId];
-
-      if (!worker) {
-        // We think we have a worker that is not actually online. This implies
-        // that we've gone out-of-date w/r/t Node's cluster.
-        log(`[${workerId}] worker id does not exist`);
-        unsendableMessages.push(m);
-        return;
-      }
 
       log(`send to ${workerId}: ${JSON.stringify(m)}`);
 
-      worker.send(m, (err) => {
-        if (err) {
-          // An error during send probably means a worker died?
-          log(`[${workerId}] Error sending message to worker`, err);
+      driver.sendToWorker(workerId, m).catch((err) => {
+        // An error during send probably means a worker died?
+        log(`[${workerId}] Error sending message to worker`, err);
 
-          delete sentMessagesById[m.id];
-          messagesToSend.push(m);
+        delete sentMessagesById[m.id];
+        messagesToSend.push(m);
 
-          scheduleTick("error during send to worker");
-          return;
-        }
+        scheduleTick("error during send to worker");
+        return;
       });
 
       sentMessagesById[m.id] = {

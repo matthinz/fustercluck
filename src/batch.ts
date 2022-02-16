@@ -4,6 +4,7 @@ export type MessageBatch = {
   isComplete(): boolean;
   markProcessed(ids: number[]): void;
   markReceived(ids: number[]): void;
+  toString(): string;
 };
 
 type MessageState = "sent" | "processed" | "received";
@@ -37,6 +38,7 @@ export function createMessageBatch<Message extends { readonly id: number }>(
     isComplete,
     markProcessed,
     markReceived,
+    toString,
   };
 
   function allProcessed(): Promise<void> {
@@ -73,6 +75,16 @@ export function createMessageBatch<Message extends { readonly id: number }>(
         }
       }
     }
+  }
+
+  function toString() {
+    return Object.keys(messageStatesById)
+      .map((id) => {
+        const state =
+          messageStatesById[id as unknown as keyof typeof messageStatesById];
+        return `${id}:${state}`;
+      })
+      .join(",");
   }
 }
 

@@ -1,4 +1,5 @@
 import child from "child_process";
+import { Driver } from "./driver";
 
 export type MessageBase = {
   type: string;
@@ -163,6 +164,11 @@ export type StartOptions<
   PrimaryMessage extends MessageBase,
   WorkerMessage extends MessageBase
 > = {
+  /**
+   * Custom driver to use. Defaults to the Node.js cluster driver.
+   */
+  driver?: Driver;
+
   /**
    * Function used to attempt to parse unknown input into a strongly-typed message for the Primary.
    */
