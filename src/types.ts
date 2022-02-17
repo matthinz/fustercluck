@@ -48,6 +48,11 @@ export type Primary<
   ): void;
 
   /**
+   * @returns A Promise that resolves once this primary has gone idle--no messages are pending.
+   */
+  idle(): Promise<void>;
+
+  /**
    * Specifies how to initialize workers.
    * @param initializer Either a message to send, or a function that returns a message to send.
    */
@@ -178,6 +183,12 @@ export type StartOptions<
    * Function used to attempt to parse unknown input into a strongly-typed message for the Worker.
    */
   parseWorkerMessage?: (m: unknown) => WorkerMessage | undefined;
+
+  /**
+   * Time (in MS) workers are allowed to be idle until they are destroyed.
+   * Defaults to 500ms.
+   */
+  workerIdleTimeout?: number;
 };
 
 export type StartResult<

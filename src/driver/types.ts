@@ -1,13 +1,19 @@
+export type DriverEventName =
+  | "messageFromPrimary"
+  | "messageFromWorker"
+  | "workerOffline"
+  | "workerOnline";
+
 /**
  * Driver defines the interface through which we interact with the underlying
  * cluster provider.
  */
 export type Driver = {
+  getMaxNumberOfWorkers(): number;
+
   getWorkerId(): string;
 
   requestNewWorker(): void;
-
-  role(): "primary" | "worker";
 
   on(
     eventName: "messageFromPrimary",
@@ -23,9 +29,11 @@ export type Driver = {
 
   on(eventName: "workerOffline", handler: (workerId: string) => void): void;
 
-  sendToPrimary(message: unknown): Promise<void>;
+  role(): "primary" | "worker";
 
-  sendToWorker(id: string, message: unknown): Promise<void>;
+  sendToPrimary(fromWorkerId: string, message: unknown): Promise<void>;
+
+  sendToWorker(workerId: string, message: unknown): Promise<void>;
 
   stop(): Promise<void>;
 

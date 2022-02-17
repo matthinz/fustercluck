@@ -1,9 +1,7 @@
 import debug from "debug";
 import { EventEmitter } from "events";
-import os from "os";
 import { createMessageBatch, MessageBatch } from "./batch";
 import { createClusterDriver } from "./driver";
-import { Driver } from "./driver/types";
 import {
   parsePrimaryControlMessage,
   PrimaryControlMessage,
@@ -17,7 +15,18 @@ import {
   WorkerError,
 } from "./types";
 
-type WorkerState = "initializing" | "ready" | "busy";
+type WorkerState =
+  | {
+      state: "initializing";
+      messageIds: [];
+    }
+  | {
+      state: "ready" | "busy";
+      messageIds: number[];
+      idleSince?: number;
+    };
+
+type WorkerStateName = WorkerState["state"];
 
 type PrimaryState = "not_started" | "started" | "stopping" | "stopped";
 
@@ -30,6 +39,8 @@ type ReceiveListener<PrimaryMessage> = (m: PrimaryMessage) => void;
 type SendListener<WorkerMessage> = (m: WorkerMessage) => void;
 
 type StopListener = () => void;
+
+const DEFAULT_WORKER_IDLE_TIMEOUT = 1000;
 
 export function startPrimary<
   PrimaryMessage extends MessageBase,
@@ -76,8 +87,12 @@ export function startPrimary<
   let tickTimeout: NodeJS.Timeout | undefined;
   let nextTickDelay: number | undefined;
 
-  // `workerStates` is a dictionary linking worker id to the associated state.
-  const workerStates: { [id: string]: WorkerState } = {};
+  // `workers` is a dictionary linking worker id to the associated state.
+  const workers: { [id: string]: WorkerState } = {};
+
+  // `workersRequested` tracks now many workers we've asked to be created, but
+  // haven't actually seen yet.
+  let workersRequested = 0;
 
   const emitter = new EventEmitter();
 
@@ -94,6 +109,7 @@ export function startPrimary<
   return {
     role: "primary",
     handle,
+    idle,
     initializeWorkersWith,
     on,
     stop,
@@ -151,7 +167,7 @@ export function startPrimary<
   }
 
   function handleWorkerBusy(workerId: string, messageIds: number[]) {
-    setWorkerState(workerId, "busy");
+    setWorkerState(workerId, "busy", messageIds);
 
     if (messageIds.length === 0) {
       return;
@@ -174,9 +190,14 @@ export function startPrimary<
   }
 
   function handleWorkerOffline(workerId: string) {
+    if (workers[workerId] == null) {
+      return;
+    }
+
     log(`[${workerId}] disconnect`);
-    delete workerStates[workerId];
-    spawnWorkers();
+    delete workers[workerId];
+
+    adjustWorkers();
   }
 
   /**
@@ -184,6 +205,8 @@ export function startPrimary<
    * then marks the worker as "ready" to be sent messages.
    */
   function handleWorkerOnline(workerId: string) {
+    workersRequested--;
+
     if (primaryState !== "started") {
       driver.takeWorkerOffline(workerId);
       return;
@@ -193,11 +216,14 @@ export function startPrimary<
 
     if (!workerInitializer) {
       // No initialization is necessary
-      workerStates[workerId] = "ready";
+      workers[workerId] = {
+        state: "ready",
+        messageIds: [],
+      };
       return;
     }
 
-    workerStates[workerId] = "initializing";
+    workers[workerId] = { state: "initializing", messageIds: [] };
 
     // Send an initialization message to the worker, and wait for it to be processed.
     workerInitializer()
@@ -214,8 +240,16 @@ export function startPrimary<
           return;
         }
 
+        if (workers[workerId] == null) {
+          // Our worker disappeared during initialization
+          return;
+        }
+
         if (succeeded) {
-          workerStates[workerId] = "ready";
+          workers[workerId] = {
+            state: "ready",
+            messageIds: [],
+          };
           scheduleTick("worker ready");
         }
       });
@@ -230,6 +264,8 @@ export function startPrimary<
     messageIds: number[],
     canTakeMore: boolean
   ) {
+    setWorkerState(workerId, canTakeMore ? "ready" : "busy", messageIds);
+
     for (let i = 0; i < sentMessageBatches.length; i++) {
       const batch = sentMessageBatches[i];
       batch.markProcessed(messageIds);
@@ -239,7 +275,8 @@ export function startPrimary<
       }
     }
 
-    setWorkerState(workerId, canTakeMore ? "ready" : "busy");
+    adjustWorkers();
+
     scheduleTick("worker processed");
   }
 
@@ -252,6 +289,8 @@ export function startPrimary<
     messageIds: number[],
     canTakeMore: boolean
   ) {
+    setWorkerState(workerId, canTakeMore ? "ready" : "busy");
+
     for (let i = 0; i < sentMessageBatches.length; i++) {
       const batch = sentMessageBatches[i];
       batch.markReceived(messageIds);
@@ -261,9 +300,22 @@ export function startPrimary<
       }
     }
 
-    setWorkerState(workerId, canTakeMore ? "ready" : "busy");
-
     scheduleTick("received messages");
+  }
+
+  function idle(): Promise<void> {
+    const INTERVAL = 100;
+    return new Promise((resolve) => {
+      tryResolve();
+
+      function tryResolve() {
+        if (sentMessageBatches.length === 0 && messagesToProcess.length === 0) {
+          resolve();
+        } else {
+          setTimeout(tryResolve, INTERVAL);
+        }
+      }
+    });
   }
 
   /**
@@ -318,7 +370,6 @@ export function startPrimary<
       }
       case "worker_processed": {
         handleWorkerProcessed(workerId, m.messageIds, m.canTakeMore);
-        console.error(sentMessageBatches.toString());
         break;
       }
       case "worker_ready": {
@@ -504,33 +555,78 @@ export function startPrimary<
     primaryState = state;
   }
 
-  function setWorkerState(workerId: string, state: WorkerState) {
-    const currentState = workerStates[workerId];
-    if (state === currentState) {
-      return;
+  function setWorkerState(
+    workerId: string,
+    state: WorkerStateName,
+    messageIdsToRemove?: number[]
+  ) {
+    const prev = workers[workerId];
+    if (prev == null) {
+      throw new Error(`Invalid worker id: ${workerId}`);
     }
-    log(`[${workerId}] ${currentState} -> ${state}`);
-    workerStates[workerId] = state;
+
+    if (state !== prev.state) {
+      log(`[${workerId}] ${prev.state} -> ${state}`);
+    }
+
+    if (state === "initializing") {
+      throw new Error(`Can't reset worker ${workerId} to ${state}`);
+    }
+
+    workers[workerId] = {
+      state,
+      idleSince: prev.state === "initializing" ? undefined : prev.idleSince,
+      messageIds: messageIdsToRemove
+        ? prev.messageIds.filter((id) => !messageIdsToRemove.includes(id))
+        : prev.messageIds,
+    };
   }
 
   /**
-   * Forks new workers up to our limit.
+   * Looks at the workers we have and tries to spin up new ones or take
+   * unused ones offline.
    */
-  function spawnWorkers() {
-    if (primaryState !== "started") {
-      return;
+  function adjustWorkers() {
+    const workerIds = Object.keys(workers);
+    const workerCount = workerIds.length;
+    const wanted = driver.getMaxNumberOfWorkers();
+
+    if (primaryState === "started") {
+      for (let i = workerCount + workersRequested; i < wanted; i++) {
+        log("requesting new worker");
+        driver.requestNewWorker();
+        workersRequested++;
+      }
     }
 
-    const workerCount = Object.keys(workerStates).length;
-    const wanted = workersWanted();
+    // Prune any idle workers
+    workerIds.forEach((id) => {
+      const worker = workers[id];
+      if (worker == null) {
+        return;
+      }
 
-    if (workerCount >= wanted) {
-      return;
-    }
+      if (worker.state == "ready" && worker.messageIds.length == 0) {
+        if (worker.idleSince == null) {
+          worker.idleSince = Date.now();
+        } else {
+          const idleDuration = Date.now() - worker.idleSince;
 
-    for (let i = workerCount; i < wanted; i++) {
-      driver.requestNewWorker();
-    }
+          if (
+            idleDuration >
+            (options?.workerIdleTimeout ?? DEFAULT_WORKER_IDLE_TIMEOUT)
+          ) {
+            log(
+              "Worker %s has been idle for %dms. Taking offline.",
+              id,
+              idleDuration
+            );
+            driver.takeWorkerOffline(id);
+            delete workers[id];
+          }
+        }
+      }
+    });
   }
 
   function start() {
@@ -589,14 +685,15 @@ export function startPrimary<
       );
 
       Promise.all(promises).then(() => {
-        console.error("sentMessageBatches", sentMessageBatches);
         tryToStop();
       });
 
       function tryToStop() {
-        const canStop = Object.keys(workerStates).length === 0;
+        const workersLeft = Object.keys(workers).length;
+        const canStop = workersLeft === 0;
 
         if (!canStop) {
+          log("Can't stop, %d worker(s) left", workersLeft);
           setTimeout(tryToStop, 100);
           return;
         }
@@ -683,24 +780,26 @@ export function startPrimary<
       return;
     }
 
-    const allWorkerIds = Object.keys(workerStates);
+    const allWorkerIds = Object.keys(workers);
 
-    if (allWorkerIds.length === 0) {
-      // We don't have any workers ready.
-      spawnWorkers();
-      scheduleTick("no workers", 500);
-      return;
-    }
-
-    let readyWorkers = allWorkerIds.filter(
-      (id) => workerStates[id] === "ready"
+    let readyWorkerIds = allWorkerIds.filter(
+      (id) => workers[id].state === "ready"
     );
 
-    if (readyWorkers.length === 0) {
+    if (readyWorkerIds.length === 0) {
       // We don't have any workers we can send to.
-      // So let's send to all of them and let them tell us whether they
-      // are too busy.
-      readyWorkers = allWorkerIds;
+      // So let's send to the busy ones so they'll tell us if they're really
+      // still busy.
+      readyWorkerIds = allWorkerIds.filter(
+        (id) => workers[id].state === "busy"
+      );
+    }
+
+    if (readyWorkerIds.length === 0) {
+      // We _really_ don't have any workers ready.
+      adjustWorkers();
+      scheduleTick("no workers ready", 500);
+      return;
     }
 
     const unsendableMessages: typeof messagesToSend = [];
@@ -708,16 +807,47 @@ export function startPrimary<
     messagesToSend.forEach((m) => {
       const workerId =
         m.workerId ??
-        readyWorkers[Math.floor(Math.random() * readyWorkers.length)];
+        readyWorkerIds[Math.floor(Math.random() * readyWorkerIds.length)];
 
-      log(`send to ${workerId}: ${JSON.stringify(m)}`);
+      const worker = workers[workerId];
+
+      if (!worker) {
+        if (m.workerId) {
+          // This message is meant for a worker that does not exist
+          log.enabled &&
+            log(
+              "Message for worker %d, which does not exist: %s",
+              m.workerId,
+              JSON.stringify(m)
+            );
+          return;
+        }
+
+        throw new Error(`Invalid worker id: ${workerId}`);
+      }
+
+      if (worker.state !== "ready" && worker.state !== "busy") {
+        throw new Error(`Can't send to worker ${workerId} (${worker.state})`);
+      }
+
+      log.enabled && log(`send to ${workerId}: ${JSON.stringify(m)}`);
+
+      worker.messageIds.push(m.id);
 
       driver.sendToWorker(workerId, m).catch((err) => {
-        // An error during send probably means a worker died?
-        log(`[${workerId}] Error sending message to worker`, err);
-
         delete sentMessagesById[m.id];
         messagesToSend.push(m);
+
+        const worker = workers[workerId];
+        if (worker == null) {
+          log(
+            `[${workerId}] Error sending message to worker (no longer exists)`,
+            err
+          );
+        } else {
+          log(`[${workerId}] Error sending message to worker`, err);
+          worker.messageIds = worker.messageIds.filter((id) => id !== m.id);
+        }
 
         scheduleTick("error during send to worker");
         return;
@@ -734,9 +864,5 @@ export function startPrimary<
     if (messagesToSend.length > 0) {
       scheduleTick("have messages to send");
     }
-  }
-
-  function workersWanted(): number {
-    return os.cpus().length;
   }
 }

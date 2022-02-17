@@ -23,7 +23,9 @@ export function startWorker<
 ): Worker<PrimaryMessage, WorkerMessage> {
   const driver = options?.driver ?? createClusterDriver();
 
-  const log = debug(`fustercluck:worker:${driver.getWorkerId()}`);
+  const workerId = driver.getWorkerId();
+
+  const log = debug(`fustercluck:worker:${workerId}`);
 
   /**
    * workerState tracks the current state of this worker.
@@ -183,8 +185,9 @@ export function startWorker<
       return;
     }
 
-    driver.on("messageFromPrimary", handleMessage);
+    log("%s -> %s", workerState, "started");
 
+    driver.on("messageFromPrimary", handleMessage);
     workerState = "started";
   }
 
@@ -242,7 +245,7 @@ export function startWorker<
     messagesToSend.forEach((m) => {
       log.enabled && log(`send to primary: ${JSON.stringify(m)}`);
       driver
-        .sendToPrimary(m)
+        .sendToPrimary(workerId, m)
         .catch((err) => {
           log("Error sending message", err, m);
           messagesToSend.push(m);

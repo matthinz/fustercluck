@@ -1,6 +1,7 @@
 import { EventEmitter } from "events";
 import child from "child_process";
 import cluster, { Worker } from "cluster";
+import os from "os";
 import { Driver } from "./types";
 
 type WorkerEventName =
@@ -19,6 +20,7 @@ export function createClusterDriver(): Driver {
   bindEvents();
 
   return {
+    getMaxNumberOfWorkers,
     getWorkerId,
     on,
     requestNewWorker,
@@ -39,6 +41,10 @@ export function createClusterDriver(): Driver {
     } else if (cluster.isWorker) {
       process.on("message", handleProcessMessage);
     }
+  }
+
+  function getMaxNumberOfWorkers() {
+    return os.cpus().length;
   }
 
   function getWorkerId(): string {
@@ -67,10 +73,7 @@ export function createClusterDriver(): Driver {
     emitter.emit("messageFromPrimary", message);
   }
 
-  function on(
-    eventName: WorkerEventName,
-    listener: (workerId: string, message?: unknown) => void
-  ) {
+  function on(eventName: WorkerEventName, listener: (...args: any[]) => void) {
     emitter.on(eventName, listener);
   }
 
