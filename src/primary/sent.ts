@@ -143,8 +143,8 @@ export function createSendTracker<
         }
       }
 
-      if (found && batch.unreceivedMessageIds.length === 0) {
-        batch.received.resolve();
+      if (found && batch.unprocessedMessageIds.length === 0) {
+        batch.processed.resolve();
       }
 
       delete sentById[id];
