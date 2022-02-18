@@ -8,7 +8,7 @@ export function createMockDriver<
   WorkerMessage extends MessageBase
 >(
   maxWorkers: number,
-  initWorker: (worker: Worker<PrimaryMessage, WorkerMessage>) => void
+  customInitWorker: (worker: Worker<PrimaryMessage, WorkerMessage>) => void
 ): Driver {
   const workers: { [id: string]: ((message: unknown) => void) | false } = {};
   let currentWorkerId = 0;
@@ -18,6 +18,7 @@ export function createMockDriver<
   const driver = {
     getMaxNumberOfWorkers,
     getWorkerId,
+    initWorker,
     on,
     requestNewWorker,
     role,
@@ -39,6 +40,8 @@ export function createMockDriver<
     }
     return String(currentWorkerId);
   }
+
+  function initWorker(workerId: string) {}
 
   function on(eventName: DriverEventName, listener: (...args: any[]) => void) {
     if (eventName === "messageFromPrimary") {
@@ -66,7 +69,7 @@ export function createMockDriver<
       okToLeakCurrentWorkerId = true;
       try {
         const worker = startWorker<PrimaryMessage, WorkerMessage>({ driver });
-        initWorker(worker);
+        customInitWorker(worker);
       } finally {
         okToLeakCurrentWorkerId = false;
       }

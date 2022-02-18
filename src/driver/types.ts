@@ -2,7 +2,8 @@ export type DriverEventName =
   | "messageFromPrimary"
   | "messageFromWorker"
   | "workerOffline"
-  | "workerOnline";
+  | "workerOnline"
+  | "shutdown";
 
 /**
  * Driver defines the interface through which we interact with the underlying
@@ -12,6 +13,8 @@ export type Driver = {
   getMaxNumberOfWorkers(): number;
 
   getWorkerId(): string;
+
+  initWorker(workerId: string): void;
 
   requestNewWorker(): void;
 
@@ -29,6 +32,8 @@ export type Driver = {
 
   on(eventName: "workerOffline", handler: (workerId: string) => void): void;
 
+  on(eventName: "shutdown", handler: () => void): void;
+
   role(): "primary" | "worker";
 
   sendToPrimary(fromWorkerId: string, message: unknown): Promise<void>;
@@ -37,5 +42,5 @@ export type Driver = {
 
   stop(): Promise<void>;
 
-  takeWorkerOffline(workerId: string): void;
+  takeWorkerOffline(workerId: string, force: boolean): void;
 };

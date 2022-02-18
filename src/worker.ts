@@ -13,7 +13,7 @@ const NOTIFY_PRIMARY_OF_PROCESSED_DEBOUNCE_INTERVAL = 250;
 // Max # of messages that can be in the "we've processed" list
 const MAX_PROCESSED_BATCH_SIZE = 1000;
 
-type WorkerState = "not_started" | "started";
+type WorkerState = "not_started" | "started" | "draining";
 
 export function startWorker<
   PrimaryMessage extends MessageBase,
@@ -56,6 +56,8 @@ export function startWorker<
   let tickImmediate: NodeJS.Immediate | undefined;
 
   let nextMessageId = 0;
+
+  driver.initWorker(workerId);
 
   return { role: "worker", addBusyCheck, sendToPrimary, handle };
 
@@ -121,11 +123,31 @@ export function startWorker<
       return;
     }
 
-    log.enabled && log(`ENQUEUE: ${parsed.id}`);
+    log.enabled &&
+      log(`ENQUEUE: ${parsed.id} (${isBusy() ? "busy" : "not busy"})`);
 
     messagesToProcess.push(parsed);
 
     scheduleTick();
+  }
+
+  /**
+   * Handles a request that we shut down.
+   */
+  function handleShutdown() {
+    switch (workerState) {
+      case "not_started":
+        return;
+
+      case "started":
+        workerState = "draining";
+        scheduleTick();
+        return;
+
+      case "draining":
+        process.exit();
+        return;
+    }
   }
 
   function isBusy(): boolean {
@@ -188,6 +210,7 @@ export function startWorker<
     log("%s -> %s", workerState, "started");
 
     driver.on("messageFromPrimary", handleMessage);
+    driver.on("shutdown", handleShutdown);
     workerState = "started";
   }
 
@@ -256,15 +279,27 @@ export function startWorker<
 
     const receivedMessageIds: number[] = [];
 
+    if (workerState !== "started") {
+      return;
+    }
+
     // Start working through user messages.
     for (
       let m = userMessagesToProcess.shift();
-      m && !isBusy();
+      m;
       m = userMessagesToProcess.shift()
     ) {
       if (m.type !== "message") {
         throw new Error(`Invalid message type for #${m.id}`);
       }
+
+      if (isBusy()) {
+        // We're too busy to deal with this. Place the message back on the
+        // queue and stop processing further
+        userMessagesToProcess.unshift(m);
+        break;
+      }
+
       const controlMessage = m;
       const { id, message } = m;
 

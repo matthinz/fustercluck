@@ -93,13 +93,7 @@ export type Primary<
    * @param eventName
    * @param handler
    */
-  on(eventName: "stop", handler: () => void): void;
-
-  /**
-   * Puts one or more on the processing queue for the Primary.
-   * @param messages
-   */
-  sendToPrimary(messages: PrimaryMessage | PrimaryMessage[]): void;
+  on(eventName: "stopping", handler: () => void): void;
 
   /**
    * Dispatches one or more messages to workers.
@@ -183,12 +177,6 @@ export type StartOptions<
    * Function used to attempt to parse unknown input into a strongly-typed message for the Worker.
    */
   parseWorkerMessage?: (m: unknown) => WorkerMessage | undefined;
-
-  /**
-   * Time (in MS) workers are allowed to be idle until they are destroyed.
-   * Defaults to 500ms.
-   */
-  workerIdleTimeout?: number;
 };
 
 export type StartResult<

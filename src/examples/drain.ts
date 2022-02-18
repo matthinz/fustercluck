@@ -24,6 +24,10 @@ async function run() {
 }
 
 async function runPrimary(instance: fc.Primary<never, WorkerMessage>) {
+  instance.on("stopping", () => {
+    console.log("STOPPING");
+  });
+
   while (true) {
     await instance.sendToWorkersAndWaitForReceipt({
       type: "do_something",
@@ -40,13 +44,14 @@ function runWorker(instance: fc.Worker<never, WorkerMessage>) {
       new Promise((resolve) => {
         processing++;
         const delay = Math.random() * 10000;
-        console.log("Delaying %dms...", delay);
+        console.log("START %dms delay", delay);
         setTimeout(() => {
+          console.log("FINISHED %dms delay", delay);
           processing--;
           resolve();
         }, delay);
       })
   );
 
-  instance.addBusyCheck(() => processing > 10);
+  instance.addBusyCheck(() => processing >= 2);
 }

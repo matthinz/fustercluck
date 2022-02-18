@@ -8,7 +8,8 @@ type WorkerEventName =
   | "messageFromPrimary"
   | "messageFromWorker"
   | "workerOnline"
-  | "workerOffline";
+  | "workerOffline"
+  | "shutdown";
 
 /**
  * Creates a new Driver implementation that uses Node.js's built-in cluster
@@ -22,6 +23,7 @@ export function createClusterDriver(): Driver {
   return {
     getMaxNumberOfWorkers,
     getWorkerId,
+    initWorker,
     on,
     requestNewWorker,
     role,
@@ -34,9 +36,7 @@ export function createClusterDriver(): Driver {
   function bindEvents() {
     if (cluster.isPrimary) {
       cluster.addListener("online", handleOnline);
-
       cluster.addListener("disconnect", handleDisconnect);
-
       cluster.on("message", handleClusterMessage);
     } else if (cluster.isWorker) {
       process.on("message", handleProcessMessage);
@@ -73,6 +73,13 @@ export function createClusterDriver(): Driver {
     emitter.emit("messageFromPrimary", message);
   }
 
+  function initWorker(workerId: string) {
+    process.on("SIGINT", () => {
+      emitter.emit("shutdown");
+      stop();
+    });
+  }
+
   function on(eventName: WorkerEventName, listener: (...args: any[]) => void) {
     emitter.on(eventName, listener);
   }
@@ -96,7 +103,10 @@ export function createClusterDriver(): Driver {
     }
   }
 
-  function sendToPrimary(message: unknown): Promise<void> {
+  function sendToPrimary(
+    fromWorkerId: string,
+    message: unknown
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
       const { send } = process;
       if (!send) {
@@ -142,11 +152,15 @@ export function createClusterDriver(): Driver {
     emitter.removeAllListeners();
   }
 
-  function takeWorkerOffline(workerId: string) {
+  function takeWorkerOffline(workerId: string, force: boolean) {
     const worker = cluster.workers && cluster.workers[workerId];
     if (!worker) {
       throw new Error(`Invalid worker: ${workerId}`);
     }
-    worker.disconnect();
+    if (force) {
+      worker.kill();
+    } else {
+      worker.disconnect();
+    }
   }
 }
