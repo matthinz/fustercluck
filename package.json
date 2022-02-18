@@ -9,7 +9,8 @@
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf dist",
-    "prepack": "npm run clean && npm run build"
+    "prepack": "npm run clean && npm run build",
+    "test": "jest"
   },
   "author": "Matt Hinz <matthinz@gmail.com>",
   "license": "CC0",
