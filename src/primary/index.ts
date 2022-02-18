@@ -585,7 +585,6 @@ export function startPrimary<
 
       if (force) {
         // We've already asked nicely. Now just stop.
-        console.error("FORCE STOP");
         justStop();
         stoppingPromise = Promise.resolve();
       }
@@ -629,7 +628,6 @@ export function startPrimary<
     function stopAllWorkers() {
       const workersLeft = Object.keys(workers);
       workersLeft.forEach((id) => {
-        console.error("takeWorkerOffline", id);
         delete workers[id];
         driver.takeWorkerOffline(id, !!force);
       });
