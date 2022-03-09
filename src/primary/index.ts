@@ -735,6 +735,8 @@ export function startPrimary<
 
       messagesToProcess.splice(i, 1);
 
+      emitter.emit("receive", message.message);
+
       // We process a single user message each tick, since they can be
       // asynchronous.
       return executeHandlers(message.message);
@@ -767,6 +769,10 @@ export function startPrimary<
     worker.messageIds.push(message.id);
 
     sendTracker.sent(envelope);
+
+    if (message.type === "message") {
+      emitter.emit("send", message.message);
+    }
 
     // sendToWorker() is asynchronous, but we don't let it block future processing.
     driver.sendToWorker(workerId, message).catch((err) => {
