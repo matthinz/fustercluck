@@ -15,6 +15,7 @@ import {
 } from "../types";
 import { createTicker } from "../tick";
 import { createSendTracker, MessageBatch } from "./sent";
+import { toDebuggingJson } from "../util";
 
 type WorkerState =
   | {
@@ -346,7 +347,7 @@ export function startPrimary<
     message,
   }: PrimaryControlMessageEnvelope) {
     log.enabled &&
-      log(`receive from ${fromWorkerId}: ${JSON.stringify(message)}`);
+      log(`receive from ${fromWorkerId}: ${toDebuggingJson(message)}`);
 
     switch (message.type) {
       case "worker_busy": {
@@ -764,7 +765,7 @@ export function startPrimary<
     }
 
     log.enabled &&
-      log(`send to ${workerId} (${worker.state}): ${JSON.stringify(message)}`);
+      log(`send to ${workerId} (${worker.state}): ${toDebuggingJson(message)}`);
 
     worker.messageIds.push(message.id);
 

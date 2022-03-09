@@ -6,6 +6,7 @@ import {
   PrimaryControlMessage,
   WorkerControlMessage,
 } from "./messages";
+import { toDebuggingJson } from "./util";
 
 // Interval used to debounce notifications to the primary about messages we've processed
 const NOTIFY_PRIMARY_OF_PROCESSED_DEBOUNCE_INTERVAL = 250;
@@ -119,7 +120,7 @@ export function startWorker<
     const parsed = parseWorkerControlMessage(m, options?.parseWorkerMessage);
 
     if (parsed == null) {
-      log.enabled && log(`INVALID MESSAGE: ${JSON.stringify(m)}`);
+      log.enabled && log(`INVALID MESSAGE: ${toDebuggingJson(m)}`);
       return;
     }
 
@@ -266,7 +267,7 @@ export function startWorker<
 
     // Send everything we can back to the primary
     messagesToSend.forEach((m) => {
-      log.enabled && log(`send to primary: ${JSON.stringify(m)}`);
+      log.enabled && log(`send to primary: ${toDebuggingJson(m)}`);
       driver
         .sendToPrimary(workerId, m)
         .catch((err) => {
@@ -305,7 +306,7 @@ export function startWorker<
 
       receivedMessageIds.push(id);
 
-      log.enabled && log(`BEGIN processing ${id}: ${JSON.stringify(message)}`);
+      log.enabled && log(`BEGIN processing ${id}: ${toDebuggingJson(message)}`);
 
       executeHandlers(message)
         .then(() => {
@@ -318,7 +319,7 @@ export function startWorker<
         })
         .finally(() => {
           log.enabled &&
-            log(`END processing ${id}: ${JSON.stringify(message)}`);
+            log(`END processing ${id}: ${toDebuggingJson(message)}`);
           notifyPrimaryOfProcessedMessages();
         });
     }
