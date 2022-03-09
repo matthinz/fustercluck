@@ -108,7 +108,7 @@ export function startPrimary<
     initializeWorkersWith,
     on,
     stop,
-
+    sendToSelf,
     sendToWorkers,
     sendToWorkersAndWaitForProcessing,
     sendToWorkersAndWaitForReceipt,
@@ -421,6 +421,20 @@ export function startPrimary<
     return sendTracker.createBatch(messagesWithIds);
   }
 
+  function sendToSelf(messages: PrimaryMessage | PrimaryMessage[]) {
+    messages = Array.isArray(messages) ? messages : [messages];
+    messagesToProcess.push(
+      ...messages.map<PrimaryControlMessageEnvelope>((message) => ({
+        fromWorkerId: "",
+        message: {
+          id: nextMessageId++,
+          type: "message",
+          message,
+        },
+      }))
+    );
+  }
+
   /**
    * Sends a batch of messages to workers and returns a Promise that resolves
    * when _all_ messages have been received by a worker.
@@ -495,6 +509,11 @@ export function startPrimary<
     state: WorkerStateName,
     messageIdsToRemove?: number[]
   ) {
+    if (workerId === "") {
+      // This ID is reserved for when the primary sends messages to itself
+      return;
+    }
+
     const prev = workers[workerId];
     if (prev == null) {
       throw new Error(`Invalid worker id: ${workerId}`);

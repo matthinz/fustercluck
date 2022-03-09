@@ -96,6 +96,12 @@ export type Primary<
   on(eventName: "stopping", handler: () => void): void;
 
   /**
+   * Dispatches one or more messages to the primary itself.
+   * @param messages
+   */
+  sendToSelf(messages: PrimaryMessage | PrimaryMessage[]): void;
+
+  /**
    * Dispatches one or more messages to workers.
    * @param messages
    */
