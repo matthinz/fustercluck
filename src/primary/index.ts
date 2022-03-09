@@ -19,11 +19,7 @@ import { toDebuggingJson } from "../util";
 
 type WorkerState =
   | {
-      state: "initializing";
-      messageIds: [];
-    }
-  | {
-      state: "ready";
+      state: "initializing" | "ready";
       messageIds: number[];
     }
   | { state: "busy"; messageIds: number[]; lastPokeAt: number };
@@ -229,13 +225,14 @@ export function startPrimary<
 
     // Send an initialization message to the worker, and wait for it to be processed.
     workerInitializer()
-      .then((message) => sendToWorkerAndWaitForProcessing(workerId, message))
-      .catch((err) => {
-        log(`[${workerId}]: Error during initialization`, err);
-        driver.takeWorkerOffline(workerId, false);
-        return false;
+      .then((message) => {
+        log.enabled &&
+          log(`[${workerId}]: initialize with ${toDebuggingJson(message)}`);
+        return sendToWorkerAndWaitForProcessing(workerId, message);
       })
-      .then((succeeded) => {
+      .then(() => {
+        log(`[${workerId}]: Initialization complete`);
+
         if (primaryState !== "started") {
           // Something happened in the interim, take offline
           driver.takeWorkerOffline(workerId, false);
@@ -247,13 +244,16 @@ export function startPrimary<
           return;
         }
 
-        if (succeeded) {
-          workers[workerId] = {
-            state: "ready",
-            messageIds: [],
-          };
-          scheduleTick("worker ready");
-        }
+        log(`[${workerId}]: Ready`);
+        workers[workerId] = {
+          state: "ready",
+          messageIds: [],
+        };
+        scheduleTick("worker ready");
+      })
+      .catch((err) => {
+        log(`[${workerId}]: Error during initialization`, err);
+        driver.takeWorkerOffline(workerId, false);
       });
   }
 
@@ -322,7 +322,7 @@ export function startPrimary<
       workerInitializer = undefined;
     } else if (typeof initializer !== "function") {
       const initializerAsMessage: WorkerMessage = initializer;
-      initializer = () => Promise.resolve(initializerAsMessage);
+      workerInitializer = () => Promise.resolve(initializerAsMessage);
     } else {
       const initializerAsFunc:
         | (() => WorkerMessage)
@@ -703,25 +703,30 @@ export function startPrimary<
       if (readyWorkerIds.length === 0) {
         // We don't have any workers ready.
         adjustWorkers();
-        scheduleTick("no workers ready", 500);
-      } else {
-        for (let i = 0; i < messagesToSend.length; i++) {
-          const envelope = messagesToSend[i];
-          const workerId =
-            envelope.toWorkerId ??
-            readyWorkerIds[Math.floor(Math.random() * readyWorkerIds.length)];
+      }
 
-          const sent = sendMessageToWorker(envelope, workerId);
+      for (let i = 0; i < messagesToSend.length; i++) {
+        const envelope = messagesToSend[i];
+        const workerId =
+          envelope.toWorkerId ??
+          readyWorkerIds[Math.floor(Math.random() * readyWorkerIds.length)];
 
-          if (sent) {
-            messagesToSend.splice(i, 1);
-            break;
-          }
+        if (workerId == null) {
+          // We don't actually have an eligible worker -- this can happen
+          // while workers are spinning up / initializing.
+          continue;
         }
 
-        if (messagesToSend.length > 0) {
-          scheduleTick("more to send");
+        const sent = sendMessageToWorker(envelope, workerId);
+
+        if (sent) {
+          messagesToSend.splice(i, 1);
+          break;
         }
+      }
+
+      if (messagesToSend.length > 0) {
+        scheduleTick("more to send");
       }
     }
 
@@ -757,11 +762,6 @@ export function startPrimary<
         `Can't send ${message.id} to worker ${workerId} (does not exist). Ignoring.`
       );
       return true; // We lie and say we sent it to force message's removal
-    }
-
-    if (worker.state === "initializing") {
-      // This _should not_ happen
-      throw new Error(`Worker ${workerId} is still initializing`);
     }
 
     log.enabled &&
