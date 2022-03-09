@@ -103,6 +103,7 @@ export function startPrimary<
     handle,
     idle,
     initializeWorkersWith,
+    loop,
     on,
     stop,
     sendToSelf,
@@ -329,6 +330,40 @@ export function startPrimary<
         | (() => Promise<WorkerMessage>) = initializer;
       workerInitializer = () => Promise.resolve(initializerAsFunc());
     }
+  }
+
+  function loop(handler: () => any | void): Promise<void> {
+    return new Promise((resolve, reject) => {
+      start();
+
+      runHandler();
+
+      function runHandler() {
+        if (primaryState !== "started") {
+          log("primaryState is %s, stopping loop", primaryState);
+          resolve();
+          return;
+        }
+
+        let p: Promise<any>;
+
+        try {
+          p = Promise.resolve(handler());
+        } catch (err: any) {
+          log("error during loop handler: %o", err);
+          reject(err);
+          return;
+        }
+
+        p.then((result) => {
+          if (result === false) {
+            resolve();
+            return;
+          }
+          setImmediate(runHandler);
+        }, reject);
+      }
+    });
   }
 
   function on(

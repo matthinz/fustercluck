@@ -64,6 +64,12 @@ export type Primary<
   ): void;
 
   /**
+   * Begins executing an event loop, calling <handler> on each tick.
+   * @param handler
+   */
+  loop(handler: () => any | void): Promise<void>;
+
+  /**
    * Adds a handler for the "error" event, which fires whenever an error
    * is encountered while a worker is handling a message.
    * @param eventName
