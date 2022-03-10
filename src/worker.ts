@@ -7,6 +7,7 @@ import {
   WorkerControlMessage,
 } from "./messages";
 import { toDebuggingJson } from "./util";
+import { createTicker } from "./tick";
 
 // Interval used to debounce notifications to the primary about messages we've processed
 const NOTIFY_PRIMARY_OF_PROCESSED_DEBOUNCE_INTERVAL = 250;
@@ -54,6 +55,8 @@ export function startWorker<
   let nextMessageId = 0;
 
   let workerState: WorkerState = "not_started";
+
+  const { scheduleTick, stopTicking } = createTicker(tick);
 
   driver.initWorker(workerId);
 
@@ -190,12 +193,6 @@ export function startWorker<
       type: Exclude<WorkerMessage["type"], "message">;
     }
   ) {}
-
-  function scheduleTick() {
-    if (!tickImmediate) {
-      tickImmediate = setImmediate(tick);
-    }
-  }
 
   /**
    * Starts the worker.
