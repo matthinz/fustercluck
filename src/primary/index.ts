@@ -328,14 +328,23 @@ export function startPrimary<
 
   function loop(handler: () => any | void): Promise<void> {
     return new Promise((resolve, reject) => {
+      let resolving = false;
+
       start();
 
       runHandler();
 
+      function doResolve() {
+        if (!resolving) {
+          resolving = true;
+          idle().then(resolve, reject);
+        }
+      }
+
       function runHandler() {
         if (primaryState !== "started") {
           log("primaryState is %s, stopping loop", primaryState);
-          resolve();
+          doResolve();
           return;
         }
 
@@ -351,7 +360,7 @@ export function startPrimary<
 
         p.then((result) => {
           if (result === false) {
-            resolve();
+            doResolve();
             return;
           }
           setImmediate(runHandler);
