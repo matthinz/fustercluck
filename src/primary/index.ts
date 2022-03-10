@@ -695,6 +695,8 @@ export function startPrimary<
 
       stopTicking();
 
+      sendTracker.stop();
+
       emitter.removeAllListeners();
     }
   }
@@ -804,32 +806,37 @@ export function startPrimary<
 
     worker.messageIds.push(message.id);
 
-    sendTracker.sent(envelope);
-
     if (message.type === "message") {
       emitter.emit("send", message.message);
     }
 
     // sendToWorker() is asynchronous, but we don't let it block future processing.
-    driver.sendToWorker(workerId, message).catch((err) => {
-      // Send failed, so re-enqueue the message to be sent to another worker.
-      sendTracker.errorSending(envelope);
-      messagesToSend.push(envelope);
+    driver
+      .sendToWorker(workerId, message)
+      .then(() => {
+        sendTracker.sent(envelope);
+      })
+      .catch((err) => {
+        // Send failed, so re-enqueue the message to be sent to another worker.
+        sendTracker.errorSending(envelope);
+        messagesToSend.push(envelope);
 
-      const worker = workers[workerId];
-      if (worker == null) {
-        log(
-          `[${workerId}] Error sending message to worker (no longer exists)`,
-          err
-        );
-      } else {
-        log(`[${workerId}] Error sending message to worker`, err);
-        worker.messageIds = worker.messageIds.filter((id) => id !== message.id);
-      }
+        const worker = workers[workerId];
+        if (worker == null) {
+          log(
+            `[${workerId}] Error sending message to worker (no longer exists)`,
+            err
+          );
+        } else {
+          log(`[${workerId}] Error sending message to worker`, err);
+          worker.messageIds = worker.messageIds.filter(
+            (id) => id !== message.id
+          );
+        }
 
-      scheduleTick("error during send to worker");
-      return;
-    });
+        scheduleTick("error during send to worker");
+        return;
+      });
 
     // Record when we last attempted to ask a "busy" worker if it was really
     // still busy.

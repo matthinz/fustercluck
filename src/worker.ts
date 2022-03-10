@@ -14,7 +14,7 @@ const NOTIFY_PRIMARY_OF_PROCESSED_DEBOUNCE_INTERVAL = 250;
 // Max # of messages that can be in the "we've processed" list
 const MAX_PROCESSED_BATCH_SIZE = 1000;
 
-type WorkerState = "not_started" | "started" | "draining";
+type WorkerState = "not_started" | "started" | "stopping";
 
 export function startWorker<
   PrimaryMessage extends MessageBase,
@@ -27,11 +27,6 @@ export function startWorker<
   const workerId = driver.getWorkerId();
 
   const log = debug(`fustercluck:worker:${workerId}`);
-
-  /**
-   * workerState tracks the current state of this worker.
-   */
-  let workerState: WorkerState = "not_started";
 
   /**
    * Busy checks are used to evaluate whether this worker is capable of
@@ -57,6 +52,8 @@ export function startWorker<
   let tickImmediate: NodeJS.Immediate | undefined;
 
   let nextMessageId = 0;
+
+  let workerState: WorkerState = "not_started";
 
   driver.initWorker(workerId);
 
@@ -136,19 +133,19 @@ export function startWorker<
    * Handles a request that we shut down.
    */
   function handleShutdown() {
-    switch (workerState) {
-      case "not_started":
-        return;
-
-      case "started":
-        workerState = "draining";
-        scheduleTick();
-        return;
-
-      case "draining":
-        process.exit();
-        return;
+    if (workerState === "not_started") {
+      process.exit();
+      return;
     }
+
+    if (workerState === "stopping") {
+      // We've already been asked to shut down, so this time we force it.
+      process.exit(1);
+      return;
+    }
+
+    workerState = "stopping";
+    scheduleTick();
   }
 
   function isBusy(): boolean {
@@ -279,10 +276,6 @@ export function startWorker<
     messagesToSend.splice(0, messagesToSend.length);
 
     const receivedMessageIds: number[] = [];
-
-    if (workerState !== "started") {
-      return;
-    }
 
     // Start working through user messages.
     for (

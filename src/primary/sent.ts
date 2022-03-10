@@ -12,6 +12,10 @@ export type SendTracker<
 > = {
   createBatch(messages: Message[]): MessageBatch;
   errorSending(envelope: Envelope): void;
+  /**
+   * Informs the tracker that all sending has been
+   */
+  stop(): void;
   numberOfMessagesOutstanding(): number;
   sent(envelope: Envelope): void;
   received(messageId: number[]): void;
@@ -24,7 +28,13 @@ export function createSendTracker<
   Message extends { id: number },
   Envelope extends { message: Message }
 >(): SendTracker<Message, Envelope> {
-  const sentById: { [id: number]: Envelope } = {};
+  type SentMessage = {
+    envelope: Envelope;
+    received: boolean;
+    processed: boolean;
+  };
+
+  const sentById: { [id: number]: SentMessage } = {};
 
   const batchesByMessageId: {
     [id: number]: {
@@ -35,10 +45,13 @@ export function createSendTracker<
     };
   } = {};
 
+  let isStopped = false;
+
   return {
     createBatch,
     numberOfMessagesOutstanding,
     errorSending,
+    stop,
     sent,
     received,
     rejected,
@@ -86,11 +99,25 @@ export function createSendTracker<
   }
 
   function sent(envelope: Envelope) {
-    sentById[envelope.message.id] = envelope;
+    sentById[envelope.message.id] = {
+      envelope,
+      received: false,
+      processed: false,
+    };
   }
 
   function received(messageIds: number[]) {
     messageIds.forEach((id) => {
+      const sentMessage = sentById[id];
+      if (!sentMessage) {
+        throw new Error(`Unknown message id: ${id}`);
+      }
+
+      sentMessage.received = true;
+      if (sentMessage.received && sentMessage.processed) {
+        delete sentById[id];
+      }
+
       const batch = batchesByMessageId[id];
       if (!batch) {
         return;
@@ -112,23 +139,35 @@ export function createSendTracker<
   }
 
   function rejected(messageIds: number[]): Envelope[] {
-    const envelopes = messageIds.map((id) => {
-      const envelope = sentById[id];
-      if (!envelope) {
+    const result: Envelope[] = [];
+
+    messageIds.forEach((id) => {
+      const sentMessage = sentById[id];
+      if (!sentMessage) {
         throw new Error(`Unknown message id: ${id}`);
       }
-      return envelope;
-    });
 
-    envelopes.forEach(({ message: { id } }) => {
+      // Once rejected, we stop tracking the ID until it is re-sent
       delete sentById[id];
+
+      result.push(sentMessage.envelope);
     });
 
-    return envelopes;
+    return result;
   }
 
   function processed(messageIds: number[]) {
     messageIds.forEach((id) => {
+      const sentMessage = sentById[id];
+      if (!sentMessage) {
+        throw new Error(`Unknown message id: ${id}`);
+      }
+
+      sentMessage.processed = true;
+      if (sentMessage.received && sentMessage.processed) {
+        delete sentById[id];
+      }
+
       const batch = batchesByMessageId[id];
       if (!batch) {
         return;
@@ -146,15 +185,20 @@ export function createSendTracker<
       if (found && batch.unprocessedMessageIds.length === 0) {
         batch.processed.resolve();
       }
-
-      delete sentById[id];
     });
+  }
+
+  function stop() {
+    isStopped = true;
   }
 
   function waitForIdle(): Promise<void> {
     return new Promise((resolve) => {
       tryResolve();
       function tryResolve() {
+        if (isStopped) {
+          resolve();
+        }
         if (numberOfMessagesOutstanding() === 0) {
           resolve();
         } else {
