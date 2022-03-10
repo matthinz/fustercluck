@@ -109,7 +109,6 @@ export function startPrimary<
     sendToSelf,
     sendToWorkers,
     sendToWorkersAndWaitForProcessing,
-    sendToWorkersAndWaitForReceipt,
   };
 
   function handle<
@@ -476,13 +475,16 @@ export function startPrimary<
    * when _all_ messages have been received by a worker.
    * @param messages
    */
-  function sendToWorkers(messages: WorkerMessage[] | WorkerMessage) {
-    sendControlMessagesToWorkers(
+  function sendToWorkers(
+    messages: WorkerMessage | WorkerMessage[]
+  ): Promise<void> {
+    const batch = sendControlMessagesToWorkers(
       (Array.isArray(messages) ? messages : [messages]).map((message) => ({
         type: "message",
         message,
       }))
     );
+    return batch.allReceived();
   }
 
   function sendToWorkersAndWaitForProcessing(
@@ -496,18 +498,6 @@ export function startPrimary<
     );
 
     return batch.allProcessed();
-  }
-
-  function sendToWorkersAndWaitForReceipt(
-    messages: WorkerMessage | WorkerMessage[]
-  ): Promise<void> {
-    const batch = sendControlMessagesToWorkers(
-      (Array.isArray(messages) ? messages : [messages]).map((message) => ({
-        type: "message",
-        message,
-      }))
-    );
-    return batch.allReceived();
   }
 
   function sendToWorkerAndWaitForProcessing(

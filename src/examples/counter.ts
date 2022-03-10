@@ -31,7 +31,7 @@ async function run() {
 
 async function runPrimary({
   handle,
-  sendToWorkersAndWaitForReceipt,
+  sendToWorkers,
 }: Primary<CountedMessage, CountMessage>): Promise<void> {
   let number = 0;
 
@@ -41,7 +41,7 @@ async function runPrimary({
 
   while (true) {
     number++;
-    await sendToWorkersAndWaitForReceipt({
+    await sendToWorkers({
       type: "count",
       number,
     });

@@ -110,17 +110,9 @@ export type Primary<
   /**
    * Dispatches one or more messages to workers.
    * @param messages
-   */
-  sendToWorkers(messages: WorkerMessage | WorkerMessage[]): void;
-
-  /**
-   * Dispatches one or more messages to workers.
-   * @param messages
    * @returns A Promise that resolves once all messages have been _received_ by a worker.
    */
-  sendToWorkersAndWaitForReceipt(
-    messages: WorkerMessage | WorkerMessage[]
-  ): Promise<void>;
+  sendToWorkers(messages: WorkerMessage | WorkerMessage[]): Promise<void>;
 
   /**
    * Dispatches one or more messages to workers.

@@ -29,7 +29,7 @@ async function runPrimary(instance: fc.Primary<never, WorkerMessage>) {
   });
 
   while (true) {
-    await instance.sendToWorkersAndWaitForReceipt({
+    await instance.sendToWorkers({
       type: "do_something",
     });
   }
