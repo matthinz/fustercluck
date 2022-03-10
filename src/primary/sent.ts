@@ -190,6 +190,13 @@ export function createSendTracker<
 
   function stop() {
     isStopped = true;
+    Object.keys(batchesByMessageId)
+      .map((id) => Number(id))
+      .forEach((id) => {
+        batchesByMessageId[id].processed.resolve();
+        batchesByMessageId[id].received.resolve();
+        delete batchesByMessageId[id];
+      });
   }
 
   function waitForIdle(): Promise<void> {
@@ -198,6 +205,7 @@ export function createSendTracker<
       function tryResolve() {
         if (isStopped) {
           resolve();
+          return;
         }
         if (numberOfMessagesOutstanding() === 0) {
           resolve();
