@@ -181,16 +181,11 @@ export function startPrimary<
       return;
     }
 
-    if (worker.messageIds.length > 0) {
-      throw new Error(
-        `Worker went offline with pending messages: ${worker.messageIds.join(
-          ","
-        )}`
-      );
-    }
+    const envelopes = sendTracker.rejected(worker.messageIds);
+    messagesToSend.push(...envelopes);
+    scheduleTick();
 
     delete workers[workerId];
-
     log(`[${workerId}] disconnect`);
 
     adjustWorkers();
